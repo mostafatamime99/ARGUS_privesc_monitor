@@ -1,0 +1,601 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ARGUS — Dashboard</title>
+<style>
+/* ---- Variables ---- */
+:root {
+  --bg:        #0d1117;
+  --surface:   #161b22;
+  --surface2:  #1c2128;
+  --border:    #30363d;
+  --text:      #e6edf3;
+  --muted:     #8b949e;
+  --cyan:      #79c0ff;
+  --blue:      #1f6feb;
+  --blue-dim:  #1158c7;
+  --critical:  #ff7b72;
+  --high:      #f0883e;
+  --medium:    #e3b341;
+  --low:       #56d364;
+  --info:      #79c0ff;
+  --ok:        #56d364;
+  --danger:    #ff7b72;
+  --radius:    6px;
+  --mono:      "Consolas", "Menlo", monospace;
+}
+
+/* ---- Reset / Base ---- */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+html { font-size: 14px; }
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  line-height: 1.5;
+  min-height: 100vh;
+}
+a { color: var(--cyan); text-decoration: none; }
+a:hover { text-decoration: underline; }
+code { font-family: var(--mono); font-size: 0.9em; }
+
+/* ---- Layout ---- */
+.container { max-width: 1280px; margin: 0 auto; padding: 0 20px; }
+
+/* ---- Header ---- */
+header {
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  padding: 14px 0;
+  position: sticky;
+  top: 0;
+  z-index: 100;
+}
+.header-inner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  font-size: 1.2rem;
+  font-weight: 700;
+  color: var(--cyan);
+  letter-spacing: 0.08em;
+}
+.brand-sub {
+  font-size: 0.75rem;
+  color: var(--muted);
+  font-weight: 400;
+  letter-spacing: 0.05em;
+}
+.refresh-info {
+  font-size: 0.75rem;
+  color: var(--muted);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.dot {
+  width: 8px; height: 8px;
+  border-radius: 50%;
+  background: var(--ok);
+  animation: pulse 2s infinite;
+}
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
+}
+.dot.error { background: var(--danger); animation: none; }
+
+/* ---- Integrity banner ---- */
+.integrity-banner {
+  display: none;
+  background: #3d1a1a;
+  border: 1px solid var(--critical);
+  color: var(--critical);
+  padding: 10px 16px;
+  border-radius: var(--radius);
+  margin: 16px 0 0;
+  font-size: 0.85rem;
+  font-weight: 600;
+}
+
+/* ---- Summary cards ---- */
+.cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 12px;
+  margin: 24px 0;
+}
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 16px;
+}
+.card-label {
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--muted);
+  margin-bottom: 6px;
+}
+.card-value {
+  font-size: 2rem;
+  font-weight: 700;
+  line-height: 1;
+}
+.card-value.critical { color: var(--critical); }
+.card-value.high     { color: var(--high); }
+.card-value.medium   { color: var(--medium); }
+.card-value.low      { color: var(--low); }
+.card-value.info     { color: var(--cyan); }
+.card-value.total    { color: var(--text); }
+
+/* ---- Section headings ---- */
+.section-heading {
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  margin: 28px 0 12px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--border);
+}
+
+/* ---- Filters ---- */
+.filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-bottom: 14px;
+  align-items: center;
+}
+.filters select,
+.filters input[type="number"] {
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: var(--radius);
+  padding: 6px 10px;
+  font-size: 0.85rem;
+  cursor: pointer;
+}
+.filters select:focus,
+.filters input[type="number"]:focus {
+  outline: 2px solid var(--blue);
+  border-color: var(--blue);
+}
+.btn {
+  background: var(--blue-dim);
+  border: 1px solid var(--blue);
+  color: var(--text);
+  border-radius: var(--radius);
+  padding: 6px 14px;
+  font-size: 0.85rem;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+.btn:hover { background: var(--blue); }
+.btn-ghost {
+  background: transparent;
+  border-color: var(--border);
+}
+.btn-ghost:hover { background: var(--surface2); }
+.filter-label { font-size: 0.8rem; color: var(--muted); margin-right: -4px; }
+
+/* ---- Table ---- */
+.table-wrap {
+  overflow-x: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.85rem;
+}
+thead tr {
+  background: var(--surface2);
+}
+th {
+  padding: 10px 14px;
+  text-align: left;
+  font-weight: 600;
+  color: var(--muted);
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  border-bottom: 1px solid var(--border);
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+}
+th:hover { color: var(--text); }
+th .sort-icon { opacity: 0.4; margin-left: 4px; }
+th.sorted .sort-icon { opacity: 1; color: var(--cyan); }
+td {
+  padding: 9px 14px;
+  border-bottom: 1px solid var(--border);
+  vertical-align: top;
+  max-width: 480px;
+}
+tr:last-child td { border-bottom: none; }
+tr:hover td { background: var(--surface2); }
+.msg { word-break: break-word; }
+.timestamp { font-family: var(--mono); font-size: 0.78rem; color: var(--muted); white-space: nowrap; }
+.ack-badge {
+  display: inline-block;
+  padding: 1px 7px;
+  border-radius: 20px;
+  font-size: 0.7rem;
+  font-weight: 600;
+  text-transform: uppercase;
+}
+.ack-badge.yes { background: #1c3a1c; color: var(--low); }
+.ack-badge.no  { background: #2e2000; color: var(--medium); }
+
+/* ---- Severity badges ---- */
+.sev {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 20px;
+  font-size: 0.72rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  white-space: nowrap;
+}
+.sev-critical { background: #3d1111; color: var(--critical); border: 1px solid #7a2020; }
+.sev-high     { background: #2e1a0a; color: var(--high);     border: 1px solid #7a4010; }
+.sev-medium   { background: #2e2300; color: var(--medium);   border: 1px solid #7a6000; }
+.sev-low      { background: #0d2e0d; color: var(--low);      border: 1px solid #1a6a1a; }
+.sev-info     { background: #0d1f35; color: var(--info);     border: 1px solid #1f4878; }
+
+/* ---- Detector status ---- */
+.det-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: 10px;
+  margin-bottom: 32px;
+}
+.det-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.det-card.enabled { border-left: 3px solid var(--ok); }
+.det-card.disabled { border-left: 3px solid var(--border); opacity: 0.6; }
+.det-name { font-weight: 600; color: var(--text); }
+.det-meta { font-size: 0.75rem; color: var(--muted); display: flex; gap: 12px; flex-wrap: wrap; }
+.mode-badge {
+  display: inline-block;
+  padding: 1px 6px;
+  border-radius: 4px;
+  font-size: 0.68rem;
+  text-transform: uppercase;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+}
+.mode-poll  { background: #0d1f35; color: var(--info); }
+.mode-watch { background: #1a0d2e; color: #b388ff; }
+
+/* ---- Empty / loading states ---- */
+.empty-row td { text-align: center; color: var(--muted); padding: 28px; }
+.loading-spinner {
+  display: inline-block;
+  width: 14px; height: 14px;
+  border: 2px solid var(--border);
+  border-top-color: var(--cyan);
+  border-radius: 50%;
+  animation: spin 0.7s linear infinite;
+  vertical-align: middle;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* ---- Footer ---- */
+footer {
+  text-align: center;
+  color: var(--muted);
+  font-size: 0.75rem;
+  padding: 24px 0 32px;
+  border-top: 1px solid var(--border);
+  margin-top: 24px;
+}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="container">
+    <div class="header-inner">
+      <div class="brand">
+        <span>⬡ ARGUS</span>
+        <span class="brand-sub">the watcher that never sleeps &nbsp;|&nbsp; read-only dashboard</span>
+      </div>
+      <div class="refresh-info">
+        <div class="dot" id="dot"></div>
+        <span id="refresh-status">Loading…</span>
+      </div>
+    </div>
+  </div>
+</header>
+
+<main class="container">
+
+  <!-- Integrity warning banner (hidden by default) -->
+  <div class="integrity-banner" id="integrity-banner">
+    ⚠ DATABASE INTEGRITY CHECK FAILED — <span id="integrity-msg"></span>
+  </div>
+
+  <!-- Summary cards -->
+  <div class="cards" id="cards">
+    <div class="card"><div class="card-label">Total alerts</div><div class="card-value total" id="c-total">—</div></div>
+    <div class="card"><div class="card-label">Last 24 h</div><div class="card-value total" id="c-24h">—</div></div>
+    <div class="card"><div class="card-label">Critical</div><div class="card-value critical" id="c-critical">—</div></div>
+    <div class="card"><div class="card-label">High</div><div class="card-value high" id="c-high">—</div></div>
+    <div class="card"><div class="card-label">Medium</div><div class="card-value medium" id="c-medium">—</div></div>
+    <div class="card"><div class="card-label">Low / Info</div><div class="card-value low" id="c-low">—</div></div>
+  </div>
+
+  <!-- Detector status -->
+  <div class="section-heading">Detector Status</div>
+  <div class="det-grid" id="det-grid"><div class="loading-spinner"></div></div>
+
+  <!-- Alert table -->
+  <div class="section-heading">Alerts</div>
+
+  <div class="filters">
+    <span class="filter-label">Severity</span>
+    <select id="f-severity">
+      <option value="">All</option>
+      <option value="critical">Critical</option>
+      <option value="high">High</option>
+      <option value="medium">Medium</option>
+      <option value="low">Low</option>
+      <option value="info">Info</option>
+    </select>
+    <span class="filter-label">Detector</span>
+    <select id="f-detector"><option value="">All</option></select>
+    <span class="filter-label">Acked</span>
+    <select id="f-acked">
+      <option value="">All</option>
+      <option value="false">Unacknowledged</option>
+      <option value="true">Acknowledged</option>
+    </select>
+    <span class="filter-label">Limit</span>
+    <input type="number" id="f-limit" value="100" min="1" max="500" style="width:70px">
+    <button class="btn" id="apply-btn">Apply</button>
+    <button class="btn btn-ghost" id="reset-btn">Reset</button>
+  </div>
+
+  <div class="table-wrap">
+    <table id="alert-table">
+      <thead>
+        <tr>
+          <th data-col="id">ID <span class="sort-icon">↕</span></th>
+          <th data-col="timestamp">Timestamp <span class="sort-icon">↕</span></th>
+          <th data-col="severity">Severity <span class="sort-icon">↕</span></th>
+          <th data-col="detector_name">Detector <span class="sort-icon">↕</span></th>
+          <th>Message</th>
+          <th data-col="acknowledged">Ack <span class="sort-icon">↕</span></th>
+        </tr>
+      </thead>
+      <tbody id="alert-body">
+        <tr class="empty-row"><td colspan="6"><span class="loading-spinner"></span> Loading alerts…</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+</main>
+
+<footer>
+  <div class="container">
+    ARGUS Dashboard — read-only monitoring view &nbsp;|&nbsp;
+    No actions can be performed from this interface.
+    Alerts can only be acknowledged via the ARGUS CLI or SQLite directly.
+  </div>
+</footer>
+
+<script>
+"use strict";
+
+const REFRESH_INTERVAL = 30000; // ms
+let _alerts = [];
+let _sortCol = "id";
+let _sortAsc = false;
+let _refreshTimer = null;
+
+// ---- Severity helpers ----
+const SEV_RANK = { critical: 5, high: 4, medium: 3, low: 2, info: 1 };
+const SEV_EMOJI = { critical: "🔴", high: "🟠", medium: "🟡", low: "🟢", info: "🔵" };
+
+function sevBadge(sev) {
+  const s = (sev || "").toLowerCase();
+  const emoji = SEV_EMOJI[s] || "⚪";
+  return `<span class="sev sev-${s}">${emoji} ${s.toUpperCase()}</span>`;
+}
+
+function fmtTs(ts) {
+  if (!ts) return "—";
+  try {
+    return new Date(ts).toLocaleString(undefined, {
+      dateStyle: "short", timeStyle: "medium", hour12: false
+    });
+  } catch { return ts; }
+}
+
+// ---- API fetch ----
+async function apiFetch(path) {
+  const resp = await fetch(path, { credentials: "include" });
+  if (!resp.ok) {
+    if (resp.status === 401) {
+      document.getElementById("refresh-status").textContent = "Auth required — reload page";
+      return null;
+    }
+    throw new Error(`HTTP ${resp.status}`);
+  }
+  return resp.json();
+}
+
+// ---- Summary ----
+async function loadSummary() {
+  const data = await apiFetch("/api/stats/summary");
+  if (!data) return;
+
+  const sev = data.by_severity || {};
+  document.getElementById("c-total").textContent    = data.total_alerts ?? "—";
+  document.getElementById("c-24h").textContent      = data.alerts_last_24h ?? "—";
+  document.getElementById("c-critical").textContent = sev.critical ?? 0;
+  document.getElementById("c-high").textContent     = sev.high ?? 0;
+  document.getElementById("c-medium").textContent   = sev.medium ?? 0;
+  document.getElementById("c-low").textContent      = (sev.low ?? 0) + (sev.info ?? 0);
+
+  // Integrity banner
+  const banner = document.getElementById("integrity-banner");
+  if (data.integrity_status !== "ok") {
+    banner.style.display = "block";
+    document.getElementById("integrity-msg").textContent = data.integrity_message || "unknown";
+  } else {
+    banner.style.display = "none";
+  }
+}
+
+// ---- Detectors ----
+async function loadDetectors() {
+  const data = await apiFetch("/api/detectors/status");
+  if (!data) return;
+
+  const detectorSelect = document.getElementById("f-detector");
+  const existing = new Set(Array.from(detectorSelect.options).map(o => o.value));
+
+  const grid = document.getElementById("det-grid");
+  grid.innerHTML = "";
+  for (const det of data) {
+    if (!existing.has(det.name)) {
+      const opt = document.createElement("option");
+      opt.value = det.name;
+      opt.textContent = det.name;
+      detectorSelect.appendChild(opt);
+    }
+    const lastSeen = det.last_seen ? fmtTs(det.last_seen) : "never";
+    const card = document.createElement("div");
+    card.className = `det-card ${det.enabled ? "enabled" : "disabled"}`;
+    card.innerHTML = `
+      <div class="det-name">${det.name}</div>
+      <div class="det-meta">
+        <span class="mode-badge mode-${det.mode}">${det.mode}</span>
+        <span>${det.enabled ? "✓ enabled" : "disabled"}</span>
+        <span>${det.baseline_count} baseline entries</span>
+      </div>
+      <div class="det-meta">Last seen: ${lastSeen}</div>`;
+    grid.appendChild(card);
+  }
+  if (!data.length) grid.innerHTML = "<span style='color:var(--muted)'>No detectors registered yet.</span>";
+}
+
+// ---- Alerts ----
+async function loadAlerts() {
+  const severity    = document.getElementById("f-severity").value;
+  const detector    = document.getElementById("f-detector").value;
+  const ackedVal    = document.getElementById("f-acked").value;
+  const limit       = document.getElementById("f-limit").value || 100;
+
+  const params = new URLSearchParams({ limit });
+  if (severity) params.set("severity", severity);
+  if (detector) params.set("detector", detector);
+  if (ackedVal !== "") params.set("acknowledged", ackedVal);
+
+  const data = await apiFetch(`/api/alerts?${params}`);
+  if (!data) return;
+  _alerts = data;
+  renderAlerts();
+}
+
+function renderAlerts() {
+  const sorted = [..._alerts].sort((a, b) => {
+    let va = a[_sortCol], vb = b[_sortCol];
+    if (_sortCol === "severity") { va = SEV_RANK[va] ?? 0; vb = SEV_RANK[vb] ?? 0; }
+    if (va < vb) return _sortAsc ? -1 : 1;
+    if (va > vb) return _sortAsc ? 1 : -1;
+    return 0;
+  });
+
+  const tbody = document.getElementById("alert-body");
+  if (!sorted.length) {
+    tbody.innerHTML = "<tr class='empty-row'><td colspan='6'>No alerts match the current filter.</td></tr>";
+    return;
+  }
+
+  tbody.innerHTML = sorted.map(row => `
+    <tr>
+      <td><code>#${row.id}</code></td>
+      <td class="timestamp">${fmtTs(row.timestamp)}</td>
+      <td>${sevBadge(row.severity)}</td>
+      <td><code>${row.detector_name}</code></td>
+      <td class="msg">${escHtml(row.message)}</td>
+      <td><span class="ack-badge ${row.acknowledged ? 'yes' : 'no'}">${row.acknowledged ? "yes" : "no"}</span></td>
+    </tr>`).join("");
+}
+
+function escHtml(s) {
+  return String(s)
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+// ---- Sort ----
+document.querySelectorAll("th[data-col]").forEach(th => {
+  th.addEventListener("click", () => {
+    const col = th.dataset.col;
+    if (_sortCol === col) { _sortAsc = !_sortAsc; }
+    else { _sortCol = col; _sortAsc = col === "id" ? false : true; }
+    document.querySelectorAll("th").forEach(h => h.classList.remove("sorted"));
+    th.classList.add("sorted");
+    th.querySelector(".sort-icon").textContent = _sortAsc ? "↑" : "↓";
+    renderAlerts();
+  });
+});
+
+// ---- Filters ----
+document.getElementById("apply-btn").addEventListener("click", loadAlerts);
+document.getElementById("reset-btn").addEventListener("click", () => {
+  document.getElementById("f-severity").value = "";
+  document.getElementById("f-detector").value = "";
+  document.getElementById("f-acked").value = "";
+  document.getElementById("f-limit").value = "100";
+  loadAlerts();
+});
+
+// ---- Refresh loop ----
+async function refresh() {
+  const dot = document.getElementById("dot");
+  const status = document.getElementById("refresh-status");
+  try {
+    await Promise.all([loadSummary(), loadDetectors(), loadAlerts()]);
+    dot.className = "dot";
+    const now = new Date().toLocaleTimeString(undefined, { hour12: false });
+    status.textContent = `Last refreshed ${now}`;
+  } catch (err) {
+    dot.className = "dot error";
+    status.textContent = `Refresh failed: ${err.message}`;
+  }
+}
+
+// Initial load + periodic refresh
+refresh();
+_refreshTimer = setInterval(refresh, REFRESH_INTERVAL);
+</script>
+</body>
+</html>

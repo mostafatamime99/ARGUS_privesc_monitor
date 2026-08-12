@@ -297,6 +297,51 @@ async def deferred_flush_loop(
             pass
 
 
+async def startup_checks(
+    db: Database,
+    bot: TelegramBot,
+    *,
+    dry_run: bool,
+    lock: asyncio.Lock,
+) -> None:
+    """
+    Run at every daemon (re)start:
+    1. Verify the SQLite integrity chain.  Emit a CRITICAL alert if broken.
+    2. Announce the (re)start via log + Telegram so restarts leave a visible trail.
+
+    A root-level attacker who has tampered with the DB *and then* killed/restarted
+    ARGUS will trigger both alerts.  An attacker who also kills the Telegram
+    delivery cannot suppress the SQLite alert record for (2).
+    """
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+    # --- Integrity chain verification ---
+    ok, chain_msg = await asyncio.to_thread(db.verify_chain)
+    if ok:
+        logger.info("DB integrity chain: %s", chain_msg)
+    else:
+        logger.critical("DB INTEGRITY CHECK FAILED: %s", chain_msg)
+        tamper_finding = Finding(
+            detector_name="argus_integrity",
+            severity="critical",
+            message=f"Database tampering detected: {chain_msg}",
+            item_key=f"integrity:tamper",
+        )
+        await emit_findings([tamper_finding], db=db, bot=bot, dry_run=dry_run, lock=lock)
+
+    # --- Startup announcement ---
+    restart_msg = f"ARGUS daemon (re)started at {ts}"
+    logger.info(restart_msg)
+    restart_finding = Finding(
+        detector_name="argus_daemon",
+        severity="info",
+        message=restart_msg,
+        item_key=f"restart:{ts}",
+    )
+    # Always persist the restart event so the dashboard shows it; notify Telegram too.
+    await emit_findings([restart_finding], db=db, bot=bot, dry_run=dry_run, lock=lock)
+
+
 async def run_daemon(config: dict[str, Any], *, dry_run: bool = False) -> None:
     """Initialize detectors and run poll + watch loops until cancelled."""
     daemon_cfg = config.get("daemon") or {}
@@ -324,6 +369,9 @@ async def run_daemon(config: dict[str, Any], *, dry_run: bool = False) -> None:
     stop = asyncio.Event()
     lock = asyncio.Lock()
 
+    # Startup integrity check + restart announcement (before detection loops).
+    await startup_checks(db, bot, dry_run=dry_run, lock=lock)
+
     logger.info(
         "PrivescMonitor running (poll=%d, watch=%d, interval=%.1fs, dry_run=%s)",
         len(poll_detectors),
@@ -331,6 +379,32 @@ async def run_daemon(config: dict[str, Any], *, dry_run: bool = False) -> None:
         interval,
         dry_run,
     )
+
+    # --- Optional dashboard ---
+    dashboard_server = None
+    dashboard_cfg = config.get("dashboard") or {}
+    if dashboard_cfg.get("enabled"):
+        try:
+            from dashboard.app import DashboardServer, create_app  # lazy import
+
+            dash_app = create_app(config, db_path)
+            dashboard_server = DashboardServer(
+                app=dash_app,
+                host=str(dashboard_cfg.get("bind_host", "127.0.0.1")),
+                port=int(dashboard_cfg.get("port", 8420)),
+            )
+            dashboard_server.start()
+            logger.info(
+                "Dashboard listening on http://%s:%d/",
+                dashboard_server.host,
+                dashboard_server.port,
+            )
+        except ImportError as exc:
+            logger.warning(
+                "Dashboard disabled — missing dependency: %s  "
+                "(pip install fastapi uvicorn bcrypt)",
+                exc,
+            )
 
     tasks = [
         asyncio.create_task(
@@ -373,6 +447,8 @@ async def run_daemon(config: dict[str, Any], *, dry_run: bool = False) -> None:
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+        if dashboard_server is not None:
+            dashboard_server.stop()
         for detector in watch_detectors:
             stop_fn = getattr(detector, "stop", None)
             if callable(stop_fn):

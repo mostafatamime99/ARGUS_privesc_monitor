@@ -1,0 +1,83 @@
+# ARGUS — Linux Privilege Escalation Monitor
+# Systemd unit file for the main ARGUS daemon.
+#
+# Install:
+#   sudo cp deploy/argus.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now argus
+#
+# See deploy/INSTALL.md for full setup instructions including user creation,
+# directory layout, and watchdog configuration.
+
+[Unit]
+Description=ARGUS Linux Privilege Escalation Monitor
+Documentation=https://github.com/your-handle/argus
+After=network.target
+Wants=argus-watchdog.service
+
+[Service]
+Type=simple
+User=argus
+Group=argus
+
+# ------------------------------------------------------------------
+# Paths — adjust to your installation layout.
+# Default layout:
+#   /opt/argus/          → project code (read-only at runtime)
+#   /var/lib/argus/      → SQLite database and logs (writable)
+#   /etc/argus/          → config.yaml (read-only at runtime)
+# ------------------------------------------------------------------
+WorkingDirectory=/opt/argus
+ExecStart=/opt/argus/.venv/bin/python main.py -c /etc/argus/config.yaml
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=argus
+
+# ------------------------------------------------------------------
+# Hardening
+#
+# LIMITATION: A root-level attacker can still kill this process and its
+# watchdog, and can modify files before systemd restarts the daemon.
+# These directives raise the bar; they do not provide absolute protection.
+# ------------------------------------------------------------------
+
+# Make most of the filesystem read-only; allow writes only to runtime dirs.
+ProtectSystem=strict
+ReadWritePaths=/var/lib/argus /var/log/argus
+ReadOnlyPaths=/opt/argus
+
+# Isolate /tmp from the rest of the system.
+PrivateTmp=true
+
+# Prevent acquiring new privileges (e.g., via SUID binaries executed by the process).
+NoNewPrivileges=true
+
+# Drop all capabilities except the minimum required:
+#   CAP_DAC_READ_SEARCH  — read /proc files and /var/log/audit/audit.log as argus user
+# Remove this if running as root (not recommended).
+CapabilityBoundingSet=CAP_DAC_READ_SEARCH
+AmbientCapabilities=CAP_DAC_READ_SEARCH
+
+# Block access to other users' home directories.
+ProtectHome=true
+
+# Prevent loading kernel modules, changing kernel tunables, or modifying
+# control groups — ARGUS does not need any of these.
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+
+# Prevent creating SUID/SGID files.
+RestrictSUIDSGID=true
+
+# Limit address families to IP and Unix sockets (for Telegram and SQLite WAL).
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+# Deny access to most system call namespaces; keep a reasonably tight filter.
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target

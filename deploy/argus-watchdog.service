@@ -1,0 +1,52 @@
+# ARGUS Watchdog — independent health monitor for the main ARGUS daemon.
+#
+# This unit runs a small, self-contained script (argus_watchdog.py) that
+# checks whether the main 'argus' service is alive and sends a Telegram
+# alert if it goes down.
+#
+# KEY DESIGN DECISION: this unit deliberately has NO dependency on the
+# main argus.service (no Requires=, no BindsTo=).  It must stay alive
+# even if the main daemon is stopped, crashing, or broken.
+#
+# LIMITATION: A root-level attacker who kills argus.service can also kill
+# this watchdog.  Two independent systemd units provide two layers, but
+# cannot prevent a determined root attacker from disabling both.
+# Document this honestly to operators.
+#
+# Install:
+#   sudo cp deploy/argus-watchdog.service /etc/systemd/system/
+#   sudo cp deploy/watchdog-config.example.json /etc/argus/watchdog.json
+#   # Edit /etc/argus/watchdog.json with real bot_token and chat_id
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now argus-watchdog
+
+[Unit]
+Description=ARGUS Watchdog — monitors the main ARGUS daemon process
+Documentation=https://github.com/your-handle/argus
+After=network.target
+# Intentionally NOT After=argus.service — start independently.
+
+[Service]
+Type=simple
+User=argus
+Group=argus
+WorkingDirectory=/opt/argus
+ExecStart=/opt/argus/.venv/bin/python argus_watchdog.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=argus-watchdog
+
+# Minimal hardening — only needs network + pidfile/systemctl access.
+PrivateTmp=true
+NoNewPrivileges=true
+ProtectHome=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+[Install]
+WantedBy=multi-user.target

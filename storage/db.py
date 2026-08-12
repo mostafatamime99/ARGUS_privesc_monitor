@@ -1,13 +1,18 @@
-"""SQLite storage for baselines and alert history."""
+"""SQLite storage for baselines, alert history, lookup cache, and integrity chain."""
 
 from __future__ import annotations
 
+import hashlib
+import json
 import sqlite3
 import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Sequence
 
+# ---------------------------------------------------------------------------
+# Schema
+# ---------------------------------------------------------------------------
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS baselines (
@@ -40,7 +45,158 @@ CREATE TABLE IF NOT EXISTS lookup_cache (
     payload    TEXT NOT NULL,
     fetched_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS integrity_chain (
+    seq        INTEGER PRIMARY KEY AUTOINCREMENT,
+    table_name TEXT NOT NULL,
+    row_key    TEXT NOT NULL,
+    row_digest TEXT NOT NULL,
+    chain_hash TEXT NOT NULL,
+    written_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_chain_seq
+    ON integrity_chain (seq);
 """
+
+# ---------------------------------------------------------------------------
+# Integrity-chain helpers (module-level so dashboard can import them too)
+# ---------------------------------------------------------------------------
+
+_GENESIS_HASH = "0" * 64  # initial prev_chain_hash before any entries
+
+
+def _alert_row_digest(
+    alert_id: int,
+    timestamp: str,
+    detector_name: str,
+    severity: str,
+    message: str,
+) -> str:
+    """Canonical digest of an alerts row.  Only immutable fields are hashed
+    (acknowledged is intentionally excluded so ACKing doesn't break the chain).
+    """
+    payload = json.dumps(
+        {
+            "table": "alerts",
+            "key": f"alerts:{alert_id}",
+            "id": alert_id,
+            "timestamp": timestamp,
+            "detector_name": detector_name,
+            "severity": severity,
+            "message": message,
+        },
+        sort_keys=True,
+    )
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def _compute_chain_hash(prev_hash: str, row_digest: str) -> str:
+    return hashlib.sha256((prev_hash + row_digest).encode()).hexdigest()
+
+
+def verify_chain_conn(conn: sqlite3.Connection) -> tuple[bool, str]:
+    """
+    Verify the integrity chain using an existing *open* SQLite connection.
+
+    The connection may be read-only (e.g. from the dashboard) or read-write
+    (from the Database class).  The function only runs SELECT statements.
+
+    Returns (ok, human_readable_message).
+
+    What this detects
+    -----------------
+    * Retroactive modification of any alerts row's core fields.
+    * Deletion of rows from the alerts table.
+    * Deletion or modification of integrity_chain rows.
+
+    What this does NOT prevent
+    --------------------------
+    A determined root-level attacker who controls the SQLite file can always
+    rewrite both tables and reconstruct a valid chain.  This is detection /
+    audit-trail hardening, not cryptographic proof of integrity.
+    """
+    chain_rows = conn.execute(
+        "SELECT seq, table_name, row_key, row_digest, chain_hash "
+        "FROM integrity_chain ORDER BY seq"
+    ).fetchall()
+
+    if not chain_rows:
+        alert_count = conn.execute("SELECT COUNT(*) FROM alerts").fetchone()[0]
+        if alert_count == 0:
+            return True, "Integrity chain empty — new installation"
+        # Existing DB created before chain feature was added; non-fatal.
+        return True, (
+            f"Integrity chain not yet seeded ({alert_count} pre-existing alert(s) "
+            "not covered — chain will grow from next write)"
+        )
+
+    # Load all alerts in a single pass for O(n) verification.
+    alerts_map: dict[int, sqlite3.Row] = {
+        row["id"]: row
+        for row in conn.execute(
+            "SELECT id, timestamp, detector_name, severity, message FROM alerts"
+        ).fetchall()
+    }
+
+    alert_count = len(alerts_map)
+    chain_alert_count = sum(
+        1 for r in chain_rows if r["table_name"] == "alerts"
+    )
+    if alert_count != chain_alert_count:
+        return False, (
+            f"Alert count mismatch: {alert_count} row(s) in alerts table "
+            f"but {chain_alert_count} in integrity chain "
+            "(row(s) deleted from alerts or chain entries removed)"
+        )
+
+    prev_hash = _GENESIS_HASH
+    for row in chain_rows:
+        seq = row["seq"]
+        table_name = row["table_name"]
+        row_key = row["row_key"]
+        stored_row_digest: str = row["row_digest"]
+        stored_chain_hash: str = row["chain_hash"]
+
+        # Re-derive the row digest from the actual table data.
+        if table_name == "alerts":
+            try:
+                alert_id = int(row_key.split(":")[-1])
+            except (ValueError, IndexError):
+                return False, f"seq={seq}: malformed row_key {row_key!r}"
+            alert = alerts_map.get(alert_id)
+            if alert is None:
+                return False, (
+                    f"seq={seq}: alert id={alert_id} referenced by chain "
+                    "is missing from the alerts table (deleted?)"
+                )
+            actual_digest = _alert_row_digest(
+                alert["id"],
+                alert["timestamp"],
+                alert["detector_name"],
+                alert["severity"],
+                alert["message"],
+            )
+        else:
+            # Unknown table — trust stored digest; still verify chain link.
+            actual_digest = stored_row_digest
+
+        if actual_digest != stored_row_digest:
+            return False, (
+                f"seq={seq}: {table_name} row {row_key} data does not match "
+                "the stored digest (row was modified after insertion)"
+            )
+
+        expected_chain = _compute_chain_hash(prev_hash, stored_row_digest)
+        if expected_chain != stored_chain_hash:
+            return False, (
+                f"seq={seq}: chain hash mismatch — integrity_chain row(s) "
+                "may have been modified or deleted"
+            )
+
+        prev_hash = stored_chain_hash
+
+    return True, "Integrity chain verified OK"
 
 
 class Database:
@@ -79,6 +235,33 @@ class Database:
     def close(self) -> None:
         with self._lock:
             self._conn.close()
+
+    # ------------------------------------------------------------------
+    # Integrity chain
+    # ------------------------------------------------------------------
+
+    def _append_chain_locked(
+        self, table_name: str, row_key: str, row_digest: str
+    ) -> None:
+        """Append one entry to integrity_chain.  Caller must hold self._lock
+        and must commit the enclosing transaction afterwards."""
+        row = self._conn.execute(
+            "SELECT chain_hash FROM integrity_chain ORDER BY seq DESC LIMIT 1"
+        ).fetchone()
+        prev_hash = row["chain_hash"] if row else _GENESIS_HASH
+        new_chain = _compute_chain_hash(prev_hash, row_digest)
+        now = datetime.now(timezone.utc).isoformat()
+        self._conn.execute(
+            "INSERT INTO integrity_chain "
+            "(table_name, row_key, row_digest, chain_hash, written_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (table_name, row_key, row_digest, new_chain, now),
+        )
+
+    def verify_chain(self) -> tuple[bool, str]:
+        """Verify the integrity chain; see :func:`verify_chain_conn`."""
+        with self._lock:
+            return verify_chain_conn(self._conn)
 
     def get_baseline_hashes(self, detector_name: str) -> set[str]:
         with self._lock:
@@ -208,8 +391,13 @@ class Database:
                 """,
                 (timestamp, detector_name, severity, message, int(acknowledged)),
             )
+            alert_id = int(cur.lastrowid)
+            digest = _alert_row_digest(
+                alert_id, timestamp, detector_name, severity, message
+            )
+            self._append_chain_locked("alerts", f"alerts:{alert_id}", digest)
             self._conn.commit()
-            return int(cur.lastrowid)
+            return alert_id
 
     def acknowledge_alert(self, alert_id: int) -> None:
         with self._lock:
@@ -270,3 +458,82 @@ class Database:
                 (limit,),
             )
             return list(cur.fetchall())
+
+    def query_alerts(
+        self,
+        *,
+        severity: str | None = None,
+        detector: str | None = None,
+        acknowledged: bool | None = None,
+        limit: int = 50,
+    ) -> list[sqlite3.Row]:
+        """Filtered alert query used by the dashboard."""
+        conditions: list[str] = []
+        params: list[object] = []
+        if severity:
+            conditions.append("severity = ?")
+            params.append(severity.lower())
+        if detector:
+            conditions.append("detector_name = ?")
+            params.append(detector)
+        if acknowledged is not None:
+            conditions.append("acknowledged = ?")
+            params.append(1 if acknowledged else 0)
+        where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+        params.append(max(1, min(limit, 500)))
+        with self._lock:
+            return list(
+                self._conn.execute(
+                    f"SELECT id, timestamp, detector_name, severity, message, acknowledged "
+                    f"FROM alerts {where} ORDER BY id DESC LIMIT ?",
+                    params,
+                ).fetchall()
+            )
+
+    def get_alert_by_id(self, alert_id: int) -> sqlite3.Row | None:
+        with self._lock:
+            return self._conn.execute(
+                "SELECT id, timestamp, detector_name, severity, message, acknowledged "
+                "FROM alerts WHERE id = ?",
+                (alert_id,),
+            ).fetchone()
+
+    def stats_summary(self) -> dict[str, object]:
+        """Aggregate counts for the dashboard summary cards."""
+        from datetime import datetime, timedelta, timezone  # already imported above
+
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+        with self._lock:
+            total = self._conn.execute("SELECT COUNT(*) FROM alerts").fetchone()[0]
+            last_24h = self._conn.execute(
+                "SELECT COUNT(*) FROM alerts WHERE timestamp >= ?", (cutoff,)
+            ).fetchone()[0]
+            by_severity = {
+                row[0]: row[1]
+                for row in self._conn.execute(
+                    "SELECT severity, COUNT(*) FROM alerts GROUP BY severity"
+                ).fetchall()
+            }
+            by_detector = {
+                row[0]: row[1]
+                for row in self._conn.execute(
+                    "SELECT detector_name, COUNT(*) FROM alerts GROUP BY detector_name"
+                ).fetchall()
+            }
+        return {
+            "total_alerts": total,
+            "alerts_last_24h": last_24h,
+            "by_severity": by_severity,
+            "by_detector": by_detector,
+        }
+
+    def detector_baselines_summary(self) -> list[sqlite3.Row]:
+        """Per-detector baseline counts and last-seen timestamps."""
+        with self._lock:
+            return list(
+                self._conn.execute(
+                    "SELECT detector_name, COUNT(*) AS baseline_count, "
+                    "MAX(last_seen) AS last_seen "
+                    "FROM baselines GROUP BY detector_name"
+                ).fetchall()
+            )

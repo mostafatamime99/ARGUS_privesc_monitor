@@ -55,6 +55,23 @@ watches continuously and alerts the moment system state changes.
   Apache/MySQL banners; compares installed versions against exploit-db /
   NVD *advisory ranges* (not substring guesses) and reports CVE or EDB IDs
   with a confidence level. Informational only — no exploit code or PoCs
+- **SQLite integrity chain** — every alert inserted gets a SHA-256 hash chained
+  to the previous row; on every daemon (re)start ARGUS verifies the full chain
+  and fires a CRITICAL Telegram alert if retroactive deletions or edits are
+  detected. Informational detection, not cryptographic proof — an attacker with
+  raw file access can rewrite both tables
+- **Startup announcement** — every daemon start (including auto-restarts after
+  a kill) logs and Telegram-alerts "ARGUS daemon (re)started at \<timestamp\>",
+  creating a visible restart trail
+- **Systemd hardening** (`deploy/argus.service`) — `Restart=always`, strict
+  filesystem isolation, `PrivateTmp`, `NoNewPrivileges`, capability bounding
+  set limited to `CAP_DAC_READ_SEARCH`
+- **Companion watchdog** (`deploy/argus-watchdog.service`, `argus_watchdog.py`)
+  — independent systemd unit with zero ARGUS code imports; alerts Telegram if
+  the main daemon goes down; recovers alert once the service comes back
+- **Read-only web dashboard** (`dashboard.py` / `dashboard/app.py`, opt-in) —
+  FastAPI backend, dark-themed vanilla JS frontend, HTTP Basic Auth with
+  bcrypt-hashed password; zero write endpoints; can run in-process or standalone
 - **`--dry-run` mode** — full detection pipeline and SQLite logging, zero
   outbound Telegram calls; safe for testing on production hosts
 - **Rotating log file** — configurable size and backup count; always-on,
@@ -181,8 +198,12 @@ cp config.example.yaml config.yaml
 | `telegram.max_alerts_per_minute` | `10` | Rate-limit cap; overflow is batched into a summary |
 | `detectors.enabled` | list | Which detectors to activate (see `config.example.yaml`) |
 | `detectors.version_scanner.engine` | `searchsploit` | `searchsploit` or `nvd_api` |
-| `detectors.version_scanner.cache_ttl_hours` | `24` | SQLite cache for CVE/EDB lookups |
 | `detectors.version_scanner.alert_on_low_confidence` | `false` | If false, low-confidence matches are logged but not sent to Telegram |
+| `dashboard.enabled` | `false` | Enable the read-only web dashboard |
+| `dashboard.bind_host` | `127.0.0.1` | Dashboard listen address |
+| `dashboard.port` | `8420` | Dashboard listen port |
+| `dashboard.username` | `admin` | HTTP Basic Auth username |
+| `dashboard.password_hash` | `""` | bcrypt hash of dashboard password |
 | `logging.file` | `logs/privesc_monitor.log` | Rotating log file path |
 | `logging.max_bytes` | `1048576` | Max log file size before rotation (1 MB) |
 | `logging.backup_count` | `5` | Number of rotated log files to keep |
@@ -274,16 +295,115 @@ Add to `/etc/audit/rules.d/argus.rules` and reload with `augenrules --load`:
       installed packages, kernel, and local service banners; matches
       searchsploit / NVD advisory version ranges; add `version_scanner` to
       `detectors.enabled` to activate (disabled by default)
+- [x] SQLite integrity chain — SHA-256 hash chain over all alert rows;
+      verified on every daemon start; CRITICAL alert if chain is broken
+- [x] Startup announcement — Telegram + log entry on every (re)start,
+      creating an auditable restart trail
+- [x] Systemd hardening (`deploy/argus.service`, `deploy/argus-watchdog.service`) —
+      `Restart=always`, strict FS isolation, companion watchdog with zero ARGUS
+      code imports; see `deploy/` for unit files and `INSTALL.md`
+- [x] Read-only web dashboard (`dashboard/`) — FastAPI + dark-themed frontend,
+      HTTP Basic Auth, zero write endpoints; enable via `dashboard.enabled: true`
 
 ### Planned
 
-- [ ] Web dashboard — read-only alert viewer with acknowledge interface
 - [ ] eBPF-based syscall hooks — eliminate polling latency, detect
       memory-only attacks
 - [ ] `/proc` anomaly scanner — hidden processes, namespace escape detection
 - [ ] World-writable path and `$PATH` hijack monitoring
 - [ ] Slack / generic webhook alert backends
-- [ ] Systemd unit file and install script
+
+---
+
+## Resilience & Hardening
+
+### Systemd auto-restart
+
+`deploy/argus.service` sets `Restart=always, RestartSec=5`.  Any crash or
+`SIGKILL` causes systemd to restart ARGUS automatically within 5 seconds.
+The companion `deploy/argus-watchdog.service` is an independent unit running
+`argus_watchdog.py` (no ARGUS code imports); it checks every 30 s whether
+the main service is alive and sends a Telegram alert when it is not.
+
+> **Limitation:** A root-level attacker can kill both units and disable
+> ARGUS entirely.  These services raise the bar — they do not prevent a
+> determined attacker who already has root access.  For stronger guarantees,
+> pair ARGUS with an out-of-band monitoring channel (e.g., a cloud health-check
+> service on a separate host).
+
+### Startup announcement
+
+On every start (including auto-restarts), ARGUS logs and Telegram-alerts
+`"ARGUS daemon (re)started at <timestamp>"`.  This creates a visible trail:
+if someone kills and restarts ARGUS, the restart event appears in both SQLite
+and Telegram.
+
+### SQLite integrity chain
+
+Every row written to the `alerts` table is appended to a SHA-256 hash chain
+in the `integrity_chain` table (each `chain_hash` = SHA-256(prev_hash +
+row_digest)).  On every daemon start, ARGUS re-derives the full chain and
+fires a CRITICAL alert if any row was deleted or modified.
+
+> **Limitation:** This is *detection*, not prevention.  A root attacker with
+> direct SQLite file access can rewrite both `alerts` and `integrity_chain`
+> and reconstruct a valid chain.  The feature makes *casual* or *automated*
+> tampering immediately visible; it does not protect against a forensically
+> capable adversary.  Pair with filesystem-level integrity tools (Linux IMA/EVM,
+> read-only mounts) for stronger guarantees.
+
+### Systemd unit hardening
+
+`argus.service` enables: `ProtectSystem=strict`, `ReadOnlyPaths=/opt/argus`,
+`PrivateTmp=true`, `NoNewPrivileges=true`,
+`CapabilityBoundingSet=CAP_DAC_READ_SEARCH`, `RestrictSUIDSGID=true`.
+The daemon runs as a dedicated non-root `argus` user.
+
+---
+
+## Web Dashboard
+
+The optional read-only web dashboard lets you browse alerts, view detector
+status, and check integrity health without SSH access to the host.
+
+### Enable
+
+1. Install dependencies: `pip install fastapi uvicorn bcrypt`
+2. Generate a password hash:
+   ```bash
+   python -c "from dashboard.app import hash_password; print(hash_password('yourpassword'))"
+   ```
+3. Add to `config.yaml`:
+   ```yaml
+   dashboard:
+     enabled: true
+     bind_host: 127.0.0.1
+     port: 8420
+     username: admin
+     password_hash: "$2b$12$..."   # paste the hash here
+   ```
+4. The dashboard starts automatically with the main daemon and logs its URL.
+
+### Standalone mode
+
+Run without the main daemon (reads the same SQLite file in read-only mode):
+
+```bash
+python dashboard.py -c config.yaml
+# → http://127.0.0.1:8420/
+```
+
+### Design constraints
+
+| Property | Detail |
+|---|---|
+| **Read-only** | Every API endpoint is a GET.  No endpoint writes to the DB, kills detectors, or executes commands. |
+| **Auth required** | HTTP Basic Auth + bcrypt.  Empty `password_hash` blocks all requests — no anonymous mode. |
+| **Localhost-only default** | `bind_host: 127.0.0.1` — never `0.0.0.0` unless explicitly overridden. |
+| **SQLite isolation** | Dashboard opens its own read-only SQLite URI connection (`?mode=ro`); SQLite itself rejects any write attempt. |
+
+The dashboard **cannot** acknowledge alerts, modify detectors, or execute
+anything — by deliberate design.
 
 ---
 
@@ -292,16 +412,17 @@ Add to `/etc/audit/rules.d/argus.rules` and reload with `augenrules --load`:
 ARGUS is a host-level blue team monitoring tool. It is deliberately scoped
 and honest about its boundaries:
 
-| Limitation | What it means |
-|---|---|
-| **Host-only visibility** | Monitors one machine; cannot detect lateral movement to other hosts, container escapes to the underlying node, or network-level attacks |
-| **Not a replacement for a full security audit** | Complements auditd and existing SIEM tooling; does not replicate EDR/XDR functionality |
-| **auditd dependency for `audit_parser`** | If auditd is not running or the rule keys are not loaded, `audit_parser` produces no findings — silently; there is no built-in health check for this |
-| **Telegram is a single point of failure** | If the bot token is invalid, the network is down, or Telegram's API is unreachable, alerts are queued in memory and lost on daemon restart; SQLite is always written regardless |
-| **Root-required paths** | `/var/log/audit/audit.log` and many `/proc` paths require root; run ARGUS as root or grant `CAP_DAC_READ_SEARCH` |
-| **Filesystem events only** | Memory-only attacks (`memfd_create`-based payloads, in-memory rootkits) are invisible to watchdog and poll detectors |
-| **ARGUS itself can be tampered with** | An attacker with root can kill the daemon or modify its SQLite database; pair with read-only mounts or Linux IMA/EVM for self-protection |
-| **Alert ≠ compromise** | Package managers routinely set SUID bits and modify cron entries; tune `detectors` paths and `watch_keys` to your environment to reduce false positives |
+| Limitation | What it means | Mitigation in ARGUS |
+|---|---|---|
+| **Host-only visibility** | Cannot detect lateral movement to other hosts, container escapes, or network-level attacks | Pair with a SIEM or network IDS |
+| **Root can kill ARGUS** | A process with root privileges can `kill -9` the daemon and its watchdog | Systemd `Restart=always`; companion watchdog alerts on downtime; startup announcement creates a restart trail |
+| **SQLite can be tampered** | Root can edit the database file directly | Integrity chain detects retroactive modifications; CRITICAL alert on startup if broken; immutable mounts (IMA/EVM) for stronger protection |
+| **Telegram is a single point of failure** | If the API is unreachable, alerts queue in memory and are lost on restart | SQLite is always written; out-of-band monitoring (separate host) recommended |
+| **auditd dependency for `audit_parser`** | No auditd rules → no findings, silently | Check `systemctl is-active auditd` and loaded rule keys |
+| **Root-required paths** | `/var/log/audit/audit.log` and `/proc` paths need elevated access | Run as `argus` user with `CAP_DAC_READ_SEARCH`; see `deploy/argus.service` |
+| **Filesystem events only** | Memory-only attacks (`memfd_create`, in-memory rootkits) are invisible | Combine with eBPF-based monitoring (planned) |
+| **Alert ≠ compromise** | Package managers set SUID bits, cron entries are modified by installers | Tune `scan_paths`, `watch_keys`, and `version_scanner.watch_packages` |
+| **Dashboard is detection-only** | Cannot acknowledge alerts or modify configuration via the UI | By design — use CLI/SQLite for administrative actions |
 
 ---
 

@@ -101,6 +101,18 @@ detectors:
     # Use ["*"] to query every installed package (slow).
     # watch_packages: []
 
+dashboard:
+  # Read-only web dashboard.  Add dashboard.enabled: true to activate.
+  # Requires:  pip install fastapi uvicorn bcrypt
+  enabled: false
+  bind_host: 127.0.0.1  # Never set to 0.0.0.0 unless you understand the risk.
+  port: 8420
+  # HTTP Basic Auth credentials.  Both must be set; no anonymous access.
+  username: admin
+  # Generate with:
+  #   python -c "from dashboard.app import hash_password; print(hash_password('yourpassword'))"
+  password_hash: ""
+
 logging:
   level: INFO
   file: logs/privesc_monitor.log
