@@ -4,6 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>ARGUS — Dashboard</title>
+<link rel="icon" type="image/svg+xml" href="/static/argus-logo.svg">
 <style>
 /* ---- Variables ---- */
 :root {
@@ -304,6 +305,17 @@ tr:hover td { background: var(--surface2); }
 }
 @keyframes spin { to { transform: rotate(360deg); } }
 
+/* ---- Logo ---- */
+.brand-logo {
+  width: 40px;
+  height: 40px;
+  flex-shrink: 0;
+  border-radius: 8px;
+  /* Subtle cyan glow ring matching the SVG palette */
+  box-shadow: 0 0 0 1px rgba(34,211,238,0.25), 0 0 10px rgba(34,211,238,0.15);
+  display: block;
+}
+
 /* ---- Footer ---- */
 footer {
   text-align: center;
@@ -321,7 +333,8 @@ footer {
   <div class="container">
     <div class="header-inner">
       <div class="brand">
-        <span>⬡ ARGUS</span>
+        <img src="/static/argus-logo.svg" alt="ARGUS logo" class="brand-logo">
+        <span>ARGUS</span>
         <span class="brand-sub">the watcher that never sleeps &nbsp;|&nbsp; read-only dashboard</span>
       </div>
       <div class="refresh-info">

@@ -1,0 +1,48 @@
+<svg width="512" height="512" viewBox="0 0 512 512" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <radialGradient id="bgGlow" cx="50%" cy="50%" r="60%">
+      <stop offset="0%" stop-color="#0f2a3a"/>
+      <stop offset="100%" stop-color="#0a0f14"/>
+    </radialGradient>
+    <linearGradient id="cyanStroke" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#5eead4"/>
+      <stop offset="100%" stop-color="#22d3ee"/>
+    </linearGradient>
+    <radialGradient id="irisGlow" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#22d3ee"/>
+      <stop offset="70%" stop-color="#0e7490"/>
+      <stop offset="100%" stop-color="#083344"/>
+    </radialGradient>
+    <filter id="softGlow" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="6" result="blur"/>
+      <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+  <circle cx="256" cy="256" r="256" fill="url(#bgGlow)"/>
+  <circle cx="256" cy="256" r="220" fill="none" stroke="url(#cyanStroke)" stroke-width="1.5" stroke-dasharray="4 10" opacity="0.5"/>
+  <polygon points="256,70 400,150 400,362 256,442 112,362 112,150" fill="none" stroke="url(#cyanStroke)" stroke-width="3" opacity="0.85"/>
+  <g stroke="#22d3ee" stroke-width="2" opacity="0.6">
+    <line x1="256" y1="86" x2="256" y2="102"/>
+    <line x1="386" y1="158" x2="372" y2="166"/>
+    <line x1="386" y1="354" x2="372" y2="346"/>
+    <line x1="256" y1="426" x2="256" y2="410"/>
+    <line x1="126" y1="354" x2="140" y2="346"/>
+    <line x1="126" y1="158" x2="140" y2="166"/>
+  </g>
+  <g filter="url(#softGlow)">
+    <path d="M 140 256 Q 256 176 372 256 Q 256 336 140 256 Z" fill="#0a1420" stroke="url(#cyanStroke)" stroke-width="4"/>
+    <circle cx="256" cy="256" r="46" fill="url(#irisGlow)" stroke="#5eead4" stroke-width="2"/>
+    <circle cx="256" cy="256" r="16" fill="#031218"/>
+    <circle cx="248" cy="248" r="5" fill="#a5f3fc"/>
+  </g>
+  <g stroke="#22d3ee" stroke-width="2" fill="none" opacity="0.7">
+    <path d="M 140 256 L 96 256 L 96 226"/>
+    <circle cx="96" cy="220" r="4" fill="#22d3ee"/>
+    <path d="M 372 256 L 416 256 L 416 286"/>
+    <circle cx="416" cy="292" r="4" fill="#22d3ee"/>
+    <path d="M 256 176 L 256 140 L 226 140"/>
+    <circle cx="220" cy="140" r="4" fill="#22d3ee"/>
+    <path d="M 256 336 L 256 372 L 286 372"/>
+    <circle cx="292" cy="372" r="4" fill="#22d3ee"/>
+  </g>
+</svg>
