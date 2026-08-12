@@ -16,6 +16,7 @@ detectors:
     - suid_check
     - sudoers_check
     - cron_check
+    - version_scanner
   suid_check:
     scan_paths:
       - /usr/bin
