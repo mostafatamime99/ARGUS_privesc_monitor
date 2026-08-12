@@ -22,6 +22,7 @@ from detectors.content_watch import ContentWatchDetector
 from detectors.cron_check import CronCheckDetector
 from detectors.sudoers_check import SudoersCheckDetector
 from detectors.suid_check import SuidCheckDetector
+from detectors.version_scanner import VersionScannerDetector
 from storage.db import Database
 
 logger = logging.getLogger("privesc_monitor")
@@ -33,6 +34,7 @@ logger = logging.getLogger("privesc_monitor")
 DETECTOR_REGISTRY: dict[str, tuple[type[BaseDetector], str]] = {
     "suid_check":       (SuidCheckDetector,       "poll"),
     "capability_check": (CapabilityCheckDetector, "poll"),
+    "version_scanner":  (VersionScannerDetector,  "poll"),
     "sudoers_check":    (SudoersCheckDetector,    "watch"),
     "cron_check":       (CronCheckDetector,       "watch"),
     "audit_parser":     (AuditParserDetector,     "watch"),
@@ -181,8 +183,18 @@ async def emit_findings(
         )
         return
 
-    sent = await asyncio.to_thread(bot.notify, findings)
-    logger.info("Telegram: sent %d message(s) for %d finding(s)", sent, len(findings))
+    to_notify = [f for f in findings if getattr(f, "notify", True)]
+    skipped = len(findings) - len(to_notify)
+    if skipped:
+        logger.info(
+            "Skipping Telegram for %d finding(s) (low confidence or below min_severity_alert)",
+            skipped,
+        )
+    if not to_notify:
+        return
+
+    sent = await asyncio.to_thread(bot.notify, to_notify)
+    logger.info("Telegram: sent %d message(s) for %d finding(s)", sent, len(to_notify))
 
 
 async def poll_loop(

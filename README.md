@@ -50,6 +50,11 @@ watches continuously and alerts the moment system state changes.
 - **SQLite baseline + diff deduplication** — each finding is hashed; only
   genuinely new state fires an alert; the same binary or file change never
   spams you twice
+- **Version / CVE reference scanner** (`version_scanner`, opt-in) —
+  fingerprints dpkg/rpm packages, kernel (`uname -r`), and local SSH/nginx/
+  Apache/MySQL banners; compares installed versions against exploit-db /
+  NVD *advisory ranges* (not substring guesses) and reports CVE or EDB IDs
+  with a confidence level. Informational only — no exploit code or PoCs
 - **`--dry-run` mode** — full detection pipeline and SQLite logging, zero
   outbound Telegram calls; safe for testing on production hosts
 - **Rotating log file** — configurable size and backup count; always-on,
@@ -65,7 +70,9 @@ watches continuously and alerts the moment system state changes.
 │                                                             │
 │  asyncio.run(run_daemon)                                    │
 │  ├── poll_loop  (every scan_interval_seconds)               │
-│  │    └── SuidCheckDetector.run_once()                      │
+│  │    ├── SuidCheckDetector.run_once()                      │
+│  │    ├── CapabilityCheckDetector.run_once()                │
+│  │    └── VersionScannerDetector.run_once()                 │
 │  │                                                          │
 │  ├── watch_drain_loop  (every 1 s, drains pending queue)    │
 │  │    ├── SudoersCheckDetector.run_once()                   │
@@ -134,6 +141,9 @@ pip install -r requirements.txt
 > For auditd event parsing: auditd must be running and loaded with the
 > rule keys listed in the [Recommended auditd Rules](#recommended-auditd-rules)
 > section below.
+> For `version_scanner` (optional): `searchsploit` from the exploitdb package,
+> **or** an NVD API key (`engine: nvd_api`). The detector fingerprints versions
+> and reports advisory *references* only; it does not download or run exploits.
 
 ---
 
@@ -170,6 +180,9 @@ cp config.example.yaml config.yaml
 | `telegram.enabled` | `false` | Set `true` to activate Telegram alerts |
 | `telegram.max_alerts_per_minute` | `10` | Rate-limit cap; overflow is batched into a summary |
 | `detectors.enabled` | list | Which detectors to activate (see `config.example.yaml`) |
+| `detectors.version_scanner.engine` | `searchsploit` | `searchsploit` or `nvd_api` |
+| `detectors.version_scanner.cache_ttl_hours` | `24` | SQLite cache for CVE/EDB lookups |
+| `detectors.version_scanner.alert_on_low_confidence` | `false` | If false, low-confidence matches are logged but not sent to Telegram |
 | `logging.file` | `logs/privesc_monitor.log` | Rotating log file path |
 | `logging.max_bytes` | `1048576` | Max log file size before rotation (1 MB) |
 | `logging.backup_count` | `5` | Number of rotated log files to keep |
@@ -188,6 +201,21 @@ python main.py --dry-run -c config.yaml
 # Verbose DEBUG output to console and log file
 python main.py -v -c config.yaml
 ```
+
+---
+
+## Detectors
+
+| Detector | Mode | Default | What it watches |
+|---|---|---|---|
+| `suid_check` | poll | enabled | SUID/SGID bits under common bin paths |
+| `sudoers_check` | watch | enabled | `/etc/sudoers` and `/etc/sudoers.d/` |
+| `cron_check` | watch | enabled | crontab, `/etc/cron.d/`, `/var/spool/cron/` |
+| `capability_check` | poll | opt-in | file capabilities via `getcap -r` |
+| `audit_parser` | watch | opt-in | auditd log keys (see rules below) |
+| `version_scanner` | poll | opt-in | package/kernel/service versions vs CVE/EDB *references* (self-throttled, default 1h). Does **not** use auditd. |
+
+`version_scanner` uses real version-range comparison (e.g. OpenSSH 9.4 does **not** match an advisory of `< 9.3`). Matches with a parseable range are `confidence: high` and may Telegram-alert (subject to `min_severity_alert`). Titles with no version boundary are stored as `confidence: low` for the dashboard and are not sent to Telegram unless `alert_on_low_confidence: true`.
 
 ---
 
@@ -242,6 +270,10 @@ Add to `/etc/audit/rules.d/argus.rules` and reload with `augenrules --load`:
 - [x] auditd log parser (`audit_parser`) — tails `audit.log`, parses seven
       rule keys with configurable severities; add `audit_parser` to
       `detectors.enabled` and load the auditd rules above to activate
+- [x] Version / CVE reference scanner (`version_scanner`) — fingerprints
+      installed packages, kernel, and local service banners; matches
+      searchsploit / NVD advisory version ranges; add `version_scanner` to
+      `detectors.enabled` to activate (disabled by default)
 
 ### Planned
 

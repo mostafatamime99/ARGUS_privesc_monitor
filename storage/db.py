@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 import threading
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Sequence
 
@@ -33,6 +34,12 @@ CREATE INDEX IF NOT EXISTS idx_baselines_detector
 
 CREATE INDEX IF NOT EXISTS idx_alerts_timestamp
     ON alerts (timestamp);
+
+CREATE TABLE IF NOT EXISTS lookup_cache (
+    cache_key  TEXT PRIMARY KEY,
+    payload    TEXT NOT NULL,
+    fetched_at TEXT NOT NULL
+);
 """
 
 
@@ -209,6 +216,45 @@ class Database:
             self._conn.execute(
                 "UPDATE alerts SET acknowledged = 1 WHERE id = ?",
                 (alert_id,),
+            )
+            self._conn.commit()
+
+    def get_lookup_cache(self, cache_key: str, ttl_seconds: float) -> str | None:
+        """Return cached payload if present and younger than ``ttl_seconds``."""
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT payload, fetched_at FROM lookup_cache WHERE cache_key = ?",
+                (cache_key,),
+            )
+            row = cur.fetchone()
+        if row is None:
+            return None
+        try:
+            fetched = datetime.fromisoformat(row["fetched_at"])
+            if fetched.tzinfo is None:
+                fetched = fetched.replace(tzinfo=timezone.utc)
+        except ValueError:
+            return None
+        age = datetime.now(timezone.utc) - fetched
+        if age > timedelta(seconds=ttl_seconds):
+            return None
+        return str(row["payload"])
+
+    def put_lookup_cache(
+        self, cache_key: str, payload: str, fetched_at: str | None = None
+    ) -> None:
+        """Insert or replace a lookup-cache row."""
+        ts = fetched_at or datetime.now(timezone.utc).isoformat()
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO lookup_cache (cache_key, payload, fetched_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(cache_key) DO UPDATE SET
+                    payload = excluded.payload,
+                    fetched_at = excluded.fetched_at
+                """,
+                (cache_key, payload, ts),
             )
             self._conn.commit()
 

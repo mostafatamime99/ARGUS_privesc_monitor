@@ -23,6 +23,8 @@ class Finding:
     item_key: str
     # Optional structured metadata (paths, PIDs, etc.)
     details: dict[str, Any] = field(default_factory=dict)
+    # If False, persist/log the finding but skip Telegram (low-confidence, etc.)
+    notify: bool = True
 
     def item_hash(self) -> str:
         """Hash used as the baseline identity for this finding."""

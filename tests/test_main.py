@@ -77,7 +77,7 @@ class TestBuildDetectorsAuditParser(unittest.TestCase):
             self.assertEqual(watch[0].name, "audit_parser")
             db.close()
 
-    def test_all_five_detectors_build_without_error(self) -> None:
+    def test_all_six_detectors_build_without_error(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             db = Database(Path(tmp) / "t.db")
             log_file = Path(tmp) / "audit.log"
@@ -89,12 +89,17 @@ class TestBuildDetectorsAuditParser(unittest.TestCase):
                     "enabled": [
                         "suid_check",
                         "capability_check",
+                        "version_scanner",
                         "sudoers_check",
                         "cron_check",
                         "audit_parser",
                     ],
                     "suid_check": {"scan_paths": [tmp]},
                     "capability_check": {"scan_roots": [tmp]},
+                    "version_scanner": {
+                        "engine": "searchsploit",
+                        "scan_interval_seconds": 3600,
+                    },
                     "sudoers_check": {
                         "watch_files": [str(Path(tmp) / "sudoers")],
                         "watch_dirs": [str(Path(tmp) / "sudoers.d")],
@@ -112,7 +117,7 @@ class TestBuildDetectorsAuditParser(unittest.TestCase):
             poll, watch = app.build_detectors(config, db)
             self.assertEqual(
                 sorted(d.name for d in poll),
-                ["capability_check", "suid_check"],
+                ["capability_check", "suid_check", "version_scanner"],
             )
             self.assertEqual(
                 sorted(d.name for d in watch),
@@ -160,6 +165,29 @@ class TestEmitFindingsDryRun(unittest.IsolatedAsyncioTestCase):
             [finding], db=db, bot=bot, dry_run=False, lock=asyncio.Lock()
         )
         bot.notify.assert_called_once()
+
+    async def test_notify_false_persists_but_skips_telegram(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        db = Database(Path(tmp.name) / "t.db")
+        self.addCleanup(db.close)
+        bot = mock.Mock()
+        bot.notify = mock.Mock(return_value=1)
+        finding = Finding(
+            detector_name="version_scanner",
+            severity="medium",
+            message="low confidence match",
+            item_key="openssh:9.1:EDB-1",
+            details={"confidence": "low"},
+            notify=False,
+        )
+        await app.emit_findings(
+            [finding], db=db, bot=bot, dry_run=False, lock=asyncio.Lock()
+        )
+        bot.notify.assert_not_called()
+        rows = db.recent_alerts(limit=5)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["detector_name"], "version_scanner")
 
 
 class TestSetupLogging(unittest.TestCase):

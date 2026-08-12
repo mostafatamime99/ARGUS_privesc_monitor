@@ -25,6 +25,8 @@ detectors:
     # - capability_check
     # Uncomment to enable (requires auditd + rules loaded):
     # - audit_parser
+    # Uncomment to enable (requires searchsploit or NVD API; see version_scanner):
+    # - version_scanner
 
   suid_check:
     scan_paths:
@@ -83,6 +85,21 @@ detectors:
       module_insertion:
         severity: critical
         label: "Kernel module insertion"
+
+  version_scanner:
+    # Add version_scanner to detectors.enabled above to activate.
+    # Fingerprints dpkg/rpm packages, kernel (uname -r), and local service
+    # banners; matches CVE / exploit-db *references* only (no exploit code).
+    enabled: false
+    engine: searchsploit          # searchsploit | nvd_api
+    scan_interval_seconds: 3600   # self-throttled; poll_loop may be faster
+    nvd_api_key: ""               # optional; raises NVD rate limit 5/30s → 50/30s
+    cache_ttl_hours: 24
+    min_severity_alert: MEDIUM
+    alert_on_low_confidence: false
+    # Optional: restrict lookups. Empty = default high-value set + kernel + banners.
+    # Use ["*"] to query every installed package (slow).
+    # watch_packages: []
 
 logging:
   level: INFO

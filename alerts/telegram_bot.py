@@ -95,7 +95,18 @@ class TelegramBot:
         ]
         if finding.details:
             # Keep details compact — path/bits are the usual signal
-            for key in ("path", "bits", "change", "mode", "event"):
+            for key in (
+                "path",
+                "bits",
+                "change",
+                "mode",
+                "event",
+                "package",
+                "installed_version",
+                "vuln_id",
+                "confidence",
+                "reference",
+            ):
                 if key in finding.details:
                     lines.append(f"{key}: {finding.details[key]}")
             diff = finding.details.get("diff")

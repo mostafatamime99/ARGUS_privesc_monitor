@@ -6,6 +6,7 @@ from detectors.capability_check import CapabilityCheckDetector
 from detectors.cron_check import CronCheckDetector
 from detectors.sudoers_check import SudoersCheckDetector
 from detectors.suid_check import SuidCheckDetector
+from detectors.version_scanner import VersionScannerDetector
 
 __all__ = [
     "BaseDetector",
@@ -15,4 +16,5 @@ __all__ = [
     "CronCheckDetector",
     "SudoersCheckDetector",
     "SuidCheckDetector",
+    "VersionScannerDetector",
 ]
