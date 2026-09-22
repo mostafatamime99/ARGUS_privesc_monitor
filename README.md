@@ -130,6 +130,9 @@ watches continuously and alerts the moment system state changes.
   outbound Telegram calls; safe for initial testing on production hosts
 - **Rotating log file** — configurable size and backup count; always-on,
   independent of Telegram availability
+- **Themed channel logs** — detectors write to `logs/detectors.log`, the CVE /
+  exploit scanner (`version_scanner`) to `logs/exploit.log`, and SQLite
+  integrity events to `logs/db.log`, each with a distinct log theme label
 
 ---
 
@@ -182,6 +185,10 @@ watches continuously and alerts the moment system state changes.
                │               │  (seq, row_digest,          │
                │               │   chain_hash, written_at)   │
                │               └─────────────────────────────┘
+               │
+               ├──► logs/detectors.log  (DETECTOR theme)
+               ├──► logs/exploit.log    (EXPLOIT theme — version_scanner)
+               └──► logs/db.log         (DB theme — integrity events)
                ▼
 ┌──────────────────────────┐    ┌─────────────────────────────┐
 │  alerts/telegram_bot.py  │───►│  telegram_outbox table      │
@@ -292,9 +299,12 @@ cp config.example.yaml config.yaml
 | `dashboard.port` | `8420` | Dashboard listen port |
 | `dashboard.username` | `admin` | HTTP Basic Auth username |
 | `dashboard.password_hash` | `""` | bcrypt hash of dashboard password (see [Enable](#enable)) |
-| `logging.file` | `logs/privesc_monitor.log` | Rotating log file path |
+| `logging.file` | `logs/privesc_monitor.log` | Main rotating daemon log |
 | `logging.max_bytes` | `1048576` | Max log file size before rotation (1 MB default) |
 | `logging.backup_count` | `5` | Number of rotated log files to keep |
+| `logging.channels.detectors.file` | `logs/detectors.log` | Themed log for SUID/sudoers/cron/capability/audit findings |
+| `logging.channels.exploit.file` | `logs/exploit.log` | Themed log for `version_scanner` CVE/EDB matches |
+| `logging.channels.db.file` | `logs/db.log` | Themed log for integrity-chain / storage events |
 
 ---
 
@@ -616,13 +626,39 @@ Follow this workflow to commission ARGUS on a new host without alert fatigue:
 6. **Enable the dashboard** — once the daemon is stable, enable the web
    dashboard and verify the integrity chain shows `ok` in the summary card.
 
+### Channel Logs (detectors / exploit / db)
+
+Findings are written to **three themed rotating files** in addition to the
+main daemon log. Each line is tagged with a fixed theme label so you can
+`tail` one stream without noise from the others:
+
+| Channel | Default file | Theme | Contents |
+|---|---|---|---|
+| `detectors` | `logs/detectors.log` | `DETECTOR` | SUID, sudoers, cron, capability, audit findings |
+| `exploit` | `logs/exploit.log` | `EXPLOIT` | `version_scanner` CVE / EDB advisory matches |
+| `db` | `logs/db.log` | `DB` | Integrity-chain OK / FAILED / recovered |
+
+Example lines:
+
+```text
+2026-09-22 14:00:01,234 │ DETECTOR │ [WARNING] argus.detectors: …
+2026-09-22 14:00:01,235 │ EXPLOIT  │ [WARNING] argus.exploit: …
+2026-09-22 14:00:01,236 │ DB       │ [CRITICAL] argus.db: …
+```
+
+Paths and theme labels are configurable under `logging.channels` in
+`config.yaml` (see `config.example.yaml`). Set `logging.channels_to_console:
+false` if you only want channel detail in the files (the main log still gets
+a one-line summary per finding).
+
 ### Log Rotation and Disk Usage
 
-**Log files** — ARGUS uses Python's `RotatingFileHandler`. With the defaults
-(`max_bytes: 1048576`, `backup_count: 5`), the maximum log footprint is 6 MB
-(one active file + five backups). On a busy host generating 50–100 alerts/day,
-the active log rotates roughly every 1–3 days. Increase `max_bytes` if you
-need longer single-file retention, or reduce `backup_count` to cap total size.
+**Log files** — ARGUS uses Python's `RotatingFileHandler` for the main log and
+each channel log. With the defaults (`max_bytes: 1048576`, `backup_count: 5`),
+each file's maximum footprint is 6 MB (one active file + five backups). On a
+busy host generating 50–100 alerts/day, the active log rotates roughly every
+1–3 days. Increase `max_bytes` if you need longer single-file retention, or
+reduce `backup_count` to cap total size.
 
 **SQLite database** — on a typical single-host deployment:
 
@@ -1047,6 +1083,7 @@ and honest about its boundaries:
 - [x] SQLite baseline and diff-based deduplication
 - [x] `--dry-run` mode
 - [x] Rotating log file
+- [x] Themed channel logs — detectors / exploit / db streams
 
 ### Implemented — enable in `config.yaml` to activate
 

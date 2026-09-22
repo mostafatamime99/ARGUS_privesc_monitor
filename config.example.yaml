@@ -125,3 +125,16 @@ logging:
   file: logs/privesc_monitor.log
   max_bytes: 1048576
   backup_count: 5
+  # Also echo themed channel lines to the console (stderr).
+  channels_to_console: true
+  # Separate themed logs — detectors vs CVE/exploit scanner vs DB integrity.
+  channels:
+    detectors:
+      file: logs/detectors.log
+      theme: DETECTOR
+    exploit:
+      file: logs/exploit.log
+      theme: EXPLOIT
+    db:
+      file: logs/db.log
+      theme: DB

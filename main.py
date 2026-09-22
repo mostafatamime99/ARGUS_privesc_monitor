@@ -25,6 +25,7 @@ from detectors.cron_check import CronCheckDetector
 from detectors.sudoers_check import SudoersCheckDetector
 from detectors.suid_check import SuidCheckDetector
 from detectors.version_scanner import VersionScannerDetector
+from logging_channels import log_db_event, log_finding_to_channel, setup_channel_logging
 from storage.db import Database
 
 logger = logging.getLogger("privesc_monitor")
@@ -56,7 +57,7 @@ def load_config(path: Path) -> dict[str, Any]:
 
 
 def setup_logging(config: dict[str, Any], *, verbose: bool = False) -> None:
-    """Configure console + rotating file logging."""
+    """Configure console + rotating main log + themed channel logs."""
     log_cfg = config.get("logging") or {}
     level_name = str(log_cfg.get("level", "INFO")).upper()
     if verbose:
@@ -93,7 +94,14 @@ def setup_logging(config: dict[str, Any], *, verbose: bool = False) -> None:
     file_handler.setLevel(level)
     root.addHandler(file_handler)
 
+    channel_paths = setup_channel_logging(
+        config,
+        level=level,
+        project_root=Path(__file__).resolve().parent,
+    )
     logger.info("Logging to %s (level=%s)", log_file, level_name)
+    for channel, path in channel_paths.items():
+        logger.info("Channel log [%s] → %s", channel, path)
 
 
 def build_detectors(
@@ -160,18 +168,16 @@ def persist_findings(
 
 
 def log_finding(finding: Finding, *, dry_run: bool) -> None:
+    """Short line on the main log; full themed detail on the channel log."""
     prefix = "[dry-run] " if dry_run else ""
-    extra = ""
-    if finding.details.get("diff"):
-        diff = str(finding.details["diff"])
-        extra = f"\n{diff}" if len(diff) < 2000 else f"\n{diff[:2000]}\n…(diff truncated in log)"
+    channel = log_finding_to_channel(finding, dry_run=dry_run)
     logger.warning(
-        "%sFinding %s/%s: %s%s",
+        "%sFinding %s/%s [%s]: %s",
         prefix,
         finding.severity.upper(),
         finding.detector_name,
+        channel,
         finding.message,
-        extra,
     )
 
 
@@ -349,8 +355,13 @@ async def startup_checks(
     ok, chain_msg = await asyncio.to_thread(db.verify_chain)
     if ok:
         logger.info("DB integrity chain: %s", chain_msg)
+        log_db_event(f"Integrity chain OK: {chain_msg}")
     else:
         logger.critical("DB INTEGRITY CHECK FAILED: %s", chain_msg)
+        log_db_event(
+            f"Integrity chain FAILED: {chain_msg}",
+            level=logging.CRITICAL,
+        )
         tamper_finding = Finding(
             detector_name="argus_integrity",
             severity="critical",
@@ -423,9 +434,14 @@ async def integrity_loop(
         if ok:
             if announced:
                 logger.info("DB integrity chain recovered: %s", chain_msg)
+                log_db_event(f"Integrity chain recovered: {chain_msg}")
             announced = False
             continue
         logger.critical("DB INTEGRITY CHECK FAILED: %s", chain_msg)
+        log_db_event(
+            f"Integrity chain FAILED (periodic): {chain_msg}",
+            level=logging.CRITICAL,
+        )
         if announced:
             continue
         announced = True

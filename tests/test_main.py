@@ -225,6 +225,17 @@ class TestEmitFindingsDryRun(unittest.IsolatedAsyncioTestCase):
 
 
 class TestSetupLogging(unittest.TestCase):
+    def tearDown(self) -> None:
+        root = logging.getLogger()
+        for handler in list(root.handlers):
+            handler.close()
+            root.removeHandler(handler)
+        for name in ("argus.detectors", "argus.exploit", "argus.db"):
+            lg = logging.getLogger(name)
+            for handler in list(lg.handlers):
+                handler.close()
+                lg.removeHandler(handler)
+
     def test_creates_rotating_log_file(self) -> None:
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
@@ -236,11 +247,83 @@ class TestSetupLogging(unittest.TestCase):
                     "file": str(log_path),
                     "max_bytes": 1024,
                     "backup_count": 2,
+                    "channels_to_console": False,
+                    "channels": {
+                        "detectors": {"file": str(Path(tmp.name) / "detectors.log")},
+                        "exploit": {"file": str(Path(tmp.name) / "exploit.log")},
+                        "db": {"file": str(Path(tmp.name) / "db.log")},
+                    },
                 }
             }
         )
         logging.getLogger("privesc_monitor").info("hello-rotate")
         self.assertTrue(log_path.is_file())
+
+    def test_findings_go_to_themed_channel_logs(self) -> None:
+        from logging_channels import (
+            channel_for_finding,
+            log_finding_to_channel,
+            setup_channel_logging,
+        )
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        paths = setup_channel_logging(
+            {
+                "logging": {
+                    "channels_to_console": False,
+                    "channels": {
+                        "detectors": {"file": str(root / "detectors.log")},
+                        "exploit": {"file": str(root / "exploit.log")},
+                        "db": {"file": str(root / "db.log")},
+                    },
+                }
+            },
+            level=logging.INFO,
+            project_root=root,
+        )
+
+        suid = Finding(
+            detector_name="suid_check",
+            severity="high",
+            message="SUID bit set",
+            item_key="suid:/bin/x",
+            details={"path": "/bin/x"},
+        )
+        cve = Finding(
+            detector_name="version_scanner",
+            severity="medium",
+            message="CVE match",
+            item_key="openssh:CVE-1",
+            details={"vuln_id": "CVE-2024-1"},
+        )
+        tamper = Finding(
+            detector_name="argus_integrity",
+            severity="critical",
+            message="chain broken",
+            item_key="integrity:tamper",
+        )
+
+        self.assertEqual(channel_for_finding(suid), "detectors")
+        self.assertEqual(channel_for_finding(cve), "exploit")
+        self.assertEqual(channel_for_finding(tamper), "db")
+
+        log_finding_to_channel(suid)
+        log_finding_to_channel(cve)
+        log_finding_to_channel(tamper)
+
+        det_text = paths["detectors"].read_text(encoding="utf-8")
+        exp_text = paths["exploit"].read_text(encoding="utf-8")
+        db_text = paths["db"].read_text(encoding="utf-8")
+        self.assertIn("SUID bit set", det_text)
+        self.assertIn("DETECTOR", det_text)
+        self.assertIn("CVE match", exp_text)
+        self.assertIn("EXPLOIT", exp_text)
+        self.assertIn("chain broken", db_text)
+        self.assertIn("DB", db_text)
+        self.assertNotIn("CVE match", det_text)
+        self.assertNotIn("SUID bit set", exp_text)
 
 
 class TestAcknowledgeCli(unittest.TestCase):
