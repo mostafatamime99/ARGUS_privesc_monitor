@@ -5,6 +5,10 @@
 daemon:
   scan_interval_seconds: 60
   db_path: privesc_monitor.db
+  # Stamped on every alert and Telegram message. Empty uses the machine hostname.
+  hostname: ""
+  # Re-check the SQLite hash chain while the daemon is running. 0 disables.
+  integrity_check_seconds: 300
 
 telegram:
   enabled: false
@@ -35,6 +39,9 @@ detectors:
       - /bin
       - /sbin
       - /usr/local/bin
+    # Known-good item keys, paths, or prefixes ending in *.
+    # Example: "/usr/bin/passwd" or "suid:/usr/bin/*"
+    allowlist: []
 
   sudoers_check:
     watch_files:

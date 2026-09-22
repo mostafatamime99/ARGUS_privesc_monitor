@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from abc import ABC, abstractmethod
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
 from storage.db import Database
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -70,6 +73,12 @@ class BaseDetector(ABC):
     def __init__(self, db: Database, config: dict[str, Any] | None = None) -> None:
         self.db = db
         self.config = config or {}
+        raw_allow = self.config.get("allowlist") or []
+        if isinstance(raw_allow, str):
+            raw_allow = [raw_allow]
+        self.allowlist: list[str] = [
+            str(item).strip() for item in raw_allow if str(item).strip()
+        ]
 
     @abstractmethod
     def scan(self) -> list[Finding]:
@@ -103,10 +112,49 @@ class BaseDetector(ABC):
         """
         return [f for f in new if f.item_hash() not in old]
 
+    def is_allowlisted(self, finding: Finding) -> bool:
+        """True when config marks this finding as known-good.
+
+        An entry matches the item_key, the details path, a ``bits:path`` key
+        via a bare path, or a prefix when the entry ends with ``*``.
+        """
+        if not self.allowlist:
+            return False
+        path = str(finding.details.get("path") or "")
+        for entry in self.allowlist:
+            if entry.endswith("*"):
+                prefix = entry[:-1]
+                if finding.item_key.startswith(prefix) or (
+                    path and path.startswith(prefix)
+                ):
+                    return True
+                continue
+            if finding.item_key == entry or (path and path == entry):
+                return True
+            if finding.item_key.endswith(":" + entry):
+                return True
+        return False
+
+    def suppress_allowlisted(self, findings: list[Finding]) -> list[Finding]:
+        """Drop known-good findings after they have been written to the baseline."""
+        if not self.allowlist:
+            return findings
+        kept: list[Finding] = []
+        for finding in findings:
+            if self.is_allowlisted(finding):
+                logger.info(
+                    "Allowlist suppressed %s finding %s",
+                    self.name,
+                    finding.item_key,
+                )
+                continue
+            kept.append(finding)
+        return kept
+
     def run_once(self) -> list[Finding]:
         """Scan → diff against baseline → persist baseline → return new findings only."""
         current = self.scan()
         baseline = self.get_baseline()
         novel = self.diff(baseline, current)
         self.save_baseline(current)
-        return novel
+        return self.suppress_allowlisted(novel)

@@ -99,9 +99,21 @@ watches continuously and alerts the moment system state changes.
   NVD *advisory ranges* (not substring guesses) and reports CVE or EDB IDs
   with a confidence level; informational only — no exploit code or PoCs
 - **SQLite integrity chain** — every alert inserted gets a SHA-256 hash chained
-  to the previous row; on every daemon (re)start ARGUS verifies the full chain
-  and fires a CRITICAL Telegram alert if retroactive deletions or edits are
-  detected; informational detection, not cryptographic proof
+  to the previous row; ARGUS verifies the chain on every (re)start and on a
+  configurable interval while running, and fires a CRITICAL Telegram alert if
+  retroactive deletions or edits are detected; informational detection, not
+  cryptographic proof
+- **Structured alert storage** — each alert row stores hostname plus the
+  finding's JSON `details` (path, diff, CVE ids); the dashboard renders them
+  alongside the message
+- **Per-detector allowlist** — known-good paths or item keys (exact match or
+  trailing `*`) are baselined but never Telegram-alerted, so legitimate
+  package SUID binaries stop paging you
+- **Durable Telegram outbox** — rate-limited or failed sends are written to
+  SQLite and retried after a restart; the finding itself is always in `alerts`
+- **`python main.py ack <id>`** — acknowledge alerts without writing raw SQL;
+  the `acknowledged` column is outside the hash digest so ACK does not look
+  like tampering
 - **Startup announcement** — every daemon start (including auto-restarts after
   a kill) logs and Telegram-alerts `ARGUS daemon (re)started at <timestamp>`,
   creating a visible restart trail
@@ -129,6 +141,7 @@ watches continuously and alerts the moment system state changes.
 │                                                             │
 │  asyncio.run(run_daemon)                                    │
 │  ├── startup_checks()  (chain verify + restart announcement)│
+│  ├── integrity_loop  (periodic chain recheck)               │
 │  │                                                          │
 │  ├── poll_loop  (every scan_interval_seconds)               │
 │  │    ├── SuidCheckDetector.run_once()                      │
@@ -151,15 +164,16 @@ watches continuously and alerts the moment system state changes.
 │  BaseDetector            │    │  storage/db.py              │
 │  scan()                  │    │                             │
 │  diff(baseline, current) │◄───│  baselines table            │
-│  save_baseline(current)  │───►│  (detector_name, item_hash, │
-└──────────────┬───────────┘    │   first_seen, last_seen)    │
-               │ novel findings  └─────────────────────────────┘
+│  allowlist filter        │───►│  (detector_name, item_hash, │
+│  save_baseline(current)  │    │   first_seen, last_seen)    │
+└──────────────┬───────────┘    └─────────────────────────────┘
+               │ novel findings
                ▼
 ┌──────────────────────────┐    ┌─────────────────────────────┐
 │  emit_findings()         │───►│  alerts table               │
 │  log_finding()           │    │  (id, timestamp, detector,  │
-│  persist_findings()      │    │   severity, message,        │
-│  bot.notify()            │    │   acknowledged)             │
+│  persist_findings()      │    │   severity, message, host,  │
+│  bot.notify()            │    │   details, acknowledged)    │
 └──────────────┬───────────┘    └──────────┬──────────────────┘
                │                           │ every insert
                │                           ▼
@@ -169,10 +183,10 @@ watches continuously and alerts the moment system state changes.
                │               │   chain_hash, written_at)   │
                │               └─────────────────────────────┘
                ▼
-┌──────────────────────────┐
-│  alerts/telegram_bot.py  │
-│  format_alert()          │
-│  rate-limit window       │
+┌──────────────────────────┐    ┌─────────────────────────────┐
+│  alerts/telegram_bot.py  │───►│  telegram_outbox table      │
+│  format_alert()          │    │  (durable unsent payloads)  │
+│  rate-limit window       │    └─────────────────────────────┘
 │  POST /sendMessage API   │
 └──────────────────────────┘
 ```
@@ -260,12 +274,15 @@ cp config.example.yaml config.yaml
 |---|---|---|
 | `daemon.scan_interval_seconds` | `60` | Polling interval for SUID/capability scans |
 | `daemon.db_path` | `privesc_monitor.db` | SQLite file location |
+| `daemon.hostname` | `""` | Stamped on every alert and Telegram message; empty uses the machine hostname |
+| `daemon.integrity_check_seconds` | `300` | Re-verify the hash chain while running; `0` disables |
 | `telegram.enabled` | `false` | Set `true` to activate Telegram alerts |
 | `telegram.bot_token` | `""` | Token from BotFather |
 | `telegram.chat_id` | `""` | Target chat or channel ID |
 | `telegram.max_alerts_per_minute` | `10` | Rate-limit cap; overflow is batched into a summary |
 | `detectors.enabled` | list | Which detectors to activate (see [Detectors](#detectors)) |
 | `detectors.suid_check.scan_paths` | common bin dirs | Paths searched for SUID/SGID bits |
+| `detectors.<name>.allowlist` | `[]` | Known-good item keys, paths, or prefixes ending in `*` |
 | `detectors.version_scanner.engine` | `searchsploit` | `searchsploit` or `nvd_api` |
 | `detectors.version_scanner.alert_on_low_confidence` | `false` | If false, low-confidence matches are logged but not sent to Telegram |
 | `detectors.version_scanner.min_severity_alert` | `medium` | Minimum severity to Telegram-alert for version matches |
@@ -292,11 +309,27 @@ python main.py --dry-run -c config.yaml
 
 # Verbose DEBUG output to console and log file
 python main.py -v -c config.yaml
+
+# Acknowledge one or more alerts (does not break the integrity chain)
+python main.py ack 12 15 -c config.yaml
 ```
 
 Always run `--dry-run` first on a new host before enabling live Telegram alerts
 — it lets you review findings and tune `scan_paths`/`watch_dirs` without noise.
 See [First 24 Hours](#first-24-hours) for a recommended commissioning workflow.
+
+To silence a known-good SUID binary without narrowing `scan_paths`:
+
+```yaml
+detectors:
+  suid_check:
+    allowlist:
+      - /usr/bin/passwd
+      - suid:/usr/bin/*
+```
+
+Allowlisted items are still written to the baseline so they do not re-alert;
+they are simply never sent to Telegram or shown as new findings.
 
 ---
 
@@ -399,9 +432,11 @@ the `integrity_chain` table:
 chain_hash[n] = SHA-256( chain_hash[n-1] + row_digest[n] )
 ```
 
-On every daemon start, ARGUS re-derives the full chain. If any row has been
-deleted or modified, the chain breaks and ARGUS fires a CRITICAL Telegram alert
-before continuing.
+On every start (including auto-restarts), and again every
+`daemon.integrity_check_seconds` (default 300), ARGUS re-derives the full chain.
+If any row has been deleted or modified, the chain breaks and ARGUS fires a
+CRITICAL Telegram alert. A failure while the daemon is up is announced once;
+recovery clears that latch so a later break can alert again.
 
 > **Limitation:** This is *detection*, not prevention. A root attacker with
 > direct SQLite file access can rewrite both `alerts` and `integrity_chain` and
@@ -647,18 +682,22 @@ tampering or restart alert):
    scan. If unexpected, treat as a potential incident and follow your IR
    playbook.
 
-6. **Acknowledge in the dashboard** — currently, alert acknowledgement is
-   performed directly in the database:
+6. **Acknowledge the alert** — from the host:
+
    ```bash
-   sqlite3 privesc_monitor.db "UPDATE alerts SET acknowledged=1 WHERE id=<id>;"
+   python main.py ack <id> -c config.yaml
    ```
-   The dashboard displays acknowledgement status in the alert table.
+
+   The dashboard is read-only and shows the acknowledgement status after the
+   next refresh. Direct SQL (`UPDATE alerts SET acknowledged=1`) also works and
+   does not break the integrity chain.
 
 ### Database Tampering Detected
 
-If ARGUS sends `Database tampering detected` at startup, the SHA-256 integrity
-chain over the `alerts` table is broken. This means one or more rows have been
-deleted, modified, or inserted outside of ARGUS.
+If ARGUS sends `Database tampering detected` at startup or during a periodic
+recheck, the SHA-256 integrity chain over the `alerts` table is broken. This
+means one or more rows have been deleted, modified, or inserted outside of
+ARGUS.
 
 **First three checks:**
 
@@ -802,9 +841,9 @@ attacker compromises the dashboard credentials, they can suppress detections.
 Read-only means a compromised dashboard session gives an attacker no more
 capability than read access to the log file.
 
-Alert acknowledgement is currently performed by writing directly to the SQLite
-database. A dedicated management API with separate, stricter authentication is
-a potential future addition.
+Alert acknowledgement is done with `python main.py ack <id>` (or a direct
+`UPDATE` on the `acknowledged` column). A dedicated management API with
+separate, stricter authentication remains a potential future addition.
 
 ---
 
@@ -812,9 +851,9 @@ a potential future addition.
 
 Telegram notifications are best-effort. If the Telegram API is unreachable,
 `TelegramBot.notify()` logs the failure and the alert is still written to
-SQLite and the log file. In-memory deferred alerts are flushed by
-`deferred_flush_loop` every 15 seconds; alerts that have not been flushed when
-the daemon restarts are lost from the Telegram queue (but remain in SQLite).
+SQLite and the log file. Payloads that were not accepted by Telegram are kept
+in the `telegram_outbox` table and retried by `deferred_flush_loop` (every
+15 seconds) and again after a daemon restart via `recover_unsent()`.
 
 For environments where Telegram downtime is a concern, monitor `privesc_monitor.db`
 and the log file directly, or add an out-of-band health-check on a separate
@@ -836,13 +875,12 @@ confirmed exploitability.
 
 **The integrity chain alert fired after I manually edited the database — is that expected?**
 
-Yes. Any direct SQLite write (including acknowledged alerts via the CLI) that
-bypasses ARGUS's internal write path will break the chain, because the chain
-is only updated through ARGUS's `insert_alert()` method. The `acknowledged`
-column is intentionally excluded from the row digest specifically so that
-acknowledgement via `UPDATE alerts SET acknowledged=1` does *not* break the
-chain. Other manual modifications (deleting rows, editing `message` or
-`severity`) will break it.
+Yes. Any direct SQLite write that bypasses ARGUS's `insert_alert()` path will
+break the chain. The `acknowledged` column is intentionally excluded from the
+row digest, so `python main.py ack <id>` or
+`UPDATE alerts SET acknowledged=1` does *not* break it. Other manual
+modifications (deleting rows, editing `message`, `severity`, `hostname`, or
+`details`) will.
 
 ---
 
@@ -988,13 +1026,13 @@ and honest about its boundaries:
 | **Host-only visibility** | Cannot detect lateral movement to other hosts, container escapes, or network-level attacks | Pair with a SIEM or network IDS |
 | **Root can kill ARGUS** | A process with root privileges can `kill -9` the daemon and its watchdog | Systemd `Restart=always`; companion watchdog alerts on downtime; startup announcement creates a restart trail |
 | **SQLite can be tampered** | Root can edit the database file directly | Integrity chain detects retroactive modifications; CRITICAL alert on startup if broken; filesystem-level immutability (IMA/EVM) for stronger protection |
-| **Telegram is a single point of failure** | If the API is unreachable, alerts queue in memory and are lost on restart | SQLite is always written; out-of-band monitoring on a separate host is recommended |
+| **Telegram is a single point of failure** | If the API is unreachable, notifications queue in the SQLite outbox and retry after restart | SQLite always stores the alert; out-of-band monitoring on a separate host is still recommended |
 | **auditd dependency for `audit_parser`** | No auditd rules → no findings, silently | Check `systemctl is-active auditd` and loaded rule keys |
 | **Root-required paths** | `/var/log/audit/audit.log` and `/proc` paths need elevated access | Run as `argus` user with `CAP_DAC_READ_SEARCH`; see `deploy/argus.service` |
 | **Filesystem events only** | Memory-only attacks (`memfd_create`, in-memory rootkits) are invisible | Combine with eBPF-based monitoring (planned) |
-| **Alert ≠ compromise** | Package managers set SUID bits, cron entries are modified by installers | Tune `scan_paths`, `watch_keys`, and `version_scanner.watch_packages` |
-| **Dashboard is read-only** | Cannot acknowledge alerts or modify configuration via the UI | By design — prevents a compromised dashboard session from suppressing detections |
-| **Single-host design** | No fleet aggregation, no central dashboard across hosts | Run one instance per host; central aggregation is a roadmap item |
+| **Alert ≠ compromise** | Package managers set SUID bits, cron entries are modified by installers | Tune `scan_paths`, `allowlist`, `watch_keys`, and `version_scanner.watch_packages` |
+| **Dashboard is read-only** | Cannot acknowledge alerts or modify configuration via the UI | Use `python main.py ack <id>`; design prevents a compromised dashboard session from suppressing detections |
+| **Single-host design** | No fleet aggregation, no central dashboard across hosts | Run one instance per host; set `daemon.hostname` so shared Telegram chats stay readable; central aggregation is a roadmap item |
 
 ---
 
@@ -1015,10 +1053,14 @@ and honest about its boundaries:
 - [x] File capability detection (`capability_check`) — `getcap -r` inventory diff
 - [x] auditd log parser (`audit_parser`) — tails `audit.log`, parses seven rule keys
 - [x] Version / CVE reference scanner (`version_scanner`) — package/kernel/service version ranges vs exploit-db/NVD
-- [x] SQLite integrity chain — SHA-256 hash chain; CRITICAL alert on startup if broken
+- [x] SQLite integrity chain — SHA-256 hash chain; CRITICAL alert on startup and periodic recheck if broken
 - [x] Startup announcement — Telegram + log entry on every (re)start
 - [x] Systemd hardening (`deploy/argus.service`, `deploy/argus-watchdog.service`)
 - [x] Read-only web dashboard (`dashboard/`) — FastAPI + dark-themed frontend, HTTP Basic Auth
+- [x] Structured alert storage — hostname + JSON details on every alert row
+- [x] Per-detector allowlist — known-good paths/keys suppressed after baseline write
+- [x] Durable Telegram outbox — unsent payloads survive daemon restart
+- [x] Alert acknowledgement CLI — `python main.py ack <id>`
 
 ### Planned
 

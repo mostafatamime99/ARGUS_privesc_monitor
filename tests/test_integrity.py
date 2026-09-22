@@ -121,6 +121,85 @@ class TestVerifyChainOk(unittest.TestCase):
         ok, msg = self.db.verify_chain()
         self.assertTrue(ok, msg)
 
+    def test_details_modification_breaks_chain(self) -> None:
+        self.db.insert_alert(
+            "2026-01-01",
+            "sudoers_check",
+            "high",
+            "modified",
+            hostname="web-01",
+            details='{"path": "/etc/sudoers"}',
+        )
+        with self.db._lock:
+            self.db._conn.execute(
+                "UPDATE alerts SET details = '{\"path\": \"/tmp/nope\"}' WHERE id = 1"
+            )
+            self.db._conn.commit()
+        ok, msg = self.db.verify_chain()
+        self.assertFalse(ok)
+        self.assertIn("modified", msg.lower())
+
+
+class TestChainMigration(unittest.TestCase):
+    def test_v1_rows_still_verify_after_column_migration(self) -> None:
+        import sqlite3
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = Path(tmp.name) / "legacy.db"
+        conn = sqlite3.connect(path)
+        conn.executescript(
+            """
+            CREATE TABLE alerts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                detector_name TEXT NOT NULL,
+                severity TEXT NOT NULL,
+                message TEXT NOT NULL,
+                acknowledged INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE integrity_chain (
+                seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                table_name TEXT NOT NULL,
+                row_key TEXT NOT NULL,
+                row_digest TEXT NOT NULL,
+                chain_hash TEXT NOT NULL,
+                written_at TEXT NOT NULL
+            );
+            """
+        )
+        timestamp = "2026-01-01T00:00:00+00:00"
+        conn.execute(
+            "INSERT INTO alerts (timestamp, detector_name, severity, message, acknowledged) "
+            "VALUES (?, 'suid_check', 'high', 'legacy', 0)",
+            (timestamp,),
+        )
+        digest = _alert_row_digest(1, timestamp, "suid_check", "high", "legacy")
+        chain = _compute_chain_hash(_GENESIS_HASH, digest)
+        conn.execute(
+            "INSERT INTO integrity_chain "
+            "(table_name, row_key, row_digest, chain_hash, written_at) "
+            "VALUES ('alerts', 'alerts:1', ?, ?, '2026-01-01T00:00:00+00:00')",
+            (digest, chain),
+        )
+        conn.commit()
+        conn.close()
+
+        db = Database(path)
+        self.addCleanup(db.close)
+        ok, msg = db.verify_chain()
+        self.assertTrue(ok, msg)
+        db.insert_alert(
+            "2026-01-02T00:00:00+00:00",
+            "suid_check",
+            "high",
+            "new",
+            hostname="migrated",
+            details='{"path": "/bin/new"}',
+        )
+        ok, msg = db.verify_chain()
+        self.assertTrue(ok, msg)
+
 
 class TestVerifyChainTamper(unittest.TestCase):
     """Simulate retroactive tampering and verify detection."""

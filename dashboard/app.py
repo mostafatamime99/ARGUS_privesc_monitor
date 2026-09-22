@@ -16,6 +16,7 @@ Design constraints
 
 from __future__ import annotations
 
+import json
 import secrets
 import sqlite3
 import threading
@@ -38,7 +39,7 @@ except ImportError as _imp_err:
         "Install with: pip install fastapi uvicorn bcrypt"
     ) from _imp_err
 
-from storage.db import verify_chain_conn
+from storage.db import alert_select_columns, verify_chain_conn
 
 _STATIC_DIR = Path(__file__).parent / "static"
 _DETECTOR_MODES = {
@@ -68,6 +69,23 @@ def verify_password(plain: str, hashed: str) -> bool:
 def hash_password(plain: str) -> str:
     """Generate a bcrypt hash suitable for storage in config.yaml."""
     return _bcrypt.hashpw(plain.encode(), _bcrypt.gensalt()).decode()
+
+
+def _public_alert(row: sqlite3.Row) -> dict[str, Any]:
+    """JSON-ready alert. ``details`` is an object; empty when the column is blank."""
+    data = dict(row)
+    raw = data.get("details") or ""
+    if isinstance(raw, str):
+        if not raw:
+            data["details"] = {}
+        else:
+            try:
+                parsed = json.loads(raw)
+            except json.JSONDecodeError:
+                parsed = {"raw": raw}
+            data["details"] = parsed if isinstance(parsed, dict) else {"raw": raw}
+    data.setdefault("hostname", "")
+    return data
 
 
 # ---------------------------------------------------------------------------
@@ -193,12 +211,12 @@ def create_app(
             params.append(1 if acknowledged else 0)
         where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
         params.append(limit)
+        columns = alert_select_columns(db)
         rows = db.execute(
-            f"SELECT id, timestamp, detector_name, severity, message, acknowledged "
-            f"FROM alerts {where} ORDER BY id DESC LIMIT ?",
+            f"SELECT {columns} FROM alerts {where} ORDER BY id DESC LIMIT ?",
             params,
         ).fetchall()
-        return JSONResponse([dict(r) for r in rows])
+        return JSONResponse([_public_alert(r) for r in rows])
 
     # ------------------------------------------------------------------
     # GET /api/alerts/{id}
@@ -210,14 +228,14 @@ def create_app(
         auth=Depends(check_auth),
         db: sqlite3.Connection = Depends(get_db),
     ):
+        columns = alert_select_columns(db)
         row = db.execute(
-            "SELECT id, timestamp, detector_name, severity, message, acknowledged "
-            "FROM alerts WHERE id = ?",
+            f"SELECT {columns} FROM alerts WHERE id = ?",
             (alert_id,),
         ).fetchone()
         if row is None:
             raise HTTPException(status_code=404, detail="Alert not found")
-        return JSONResponse(dict(row))
+        return JSONResponse(_public_alert(row))
 
     # ------------------------------------------------------------------
     # GET /api/stats/summary

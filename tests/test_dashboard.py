@@ -176,8 +176,18 @@ class TestAlertsEndpoint(unittest.TestCase):
     def test_response_has_expected_fields(self) -> None:
         resp = self.client.get("/api/alerts", auth=self._auth)
         row = resp.json()[0]
-        for field in ("id", "timestamp", "detector_name", "severity", "message", "acknowledged"):
+        for field in (
+            "id",
+            "timestamp",
+            "detector_name",
+            "severity",
+            "message",
+            "acknowledged",
+            "hostname",
+            "details",
+        ):
             self.assertIn(field, row, f"Missing field: {field}")
+        self.assertIsInstance(row["details"], dict)
 
 
 # ---------------------------------------------------------------------------

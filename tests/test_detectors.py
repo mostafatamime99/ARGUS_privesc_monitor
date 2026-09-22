@@ -75,6 +75,36 @@ class TestBaselineDiff(unittest.TestCase):
         novel = det.run_once()
         self.assertEqual([f.item_key for f in novel], ["two"])
 
+    def test_allowlist_suppresses_known_good_and_still_baselines(self) -> None:
+        det = StubDetector(self.db, [_finding("keep"), _finding("alert")])
+        det.allowlist = ["keep"]
+        first = det.run_once()
+        self.assertEqual([f.item_key for f in first], ["alert"])
+        self.assertEqual(det.run_once(), [])
+        self.assertEqual(
+            self.db.get_baseline_hashes("stub"),
+            {_finding("keep").item_hash(), _finding("alert").item_hash()},
+        )
+
+    def test_allowlist_matches_path_and_prefix(self) -> None:
+        path_finding = Finding(
+            detector_name="stub",
+            severity="high",
+            message="suid",
+            item_key="suid:/usr/bin/passwd",
+            details={"path": "/usr/bin/passwd"},
+        )
+        other = Finding(
+            detector_name="stub",
+            severity="high",
+            message="other",
+            item_key="suid:/usr/local/bin/evil",
+            details={"path": "/usr/local/bin/evil"},
+        )
+        det = StubDetector(self.db, [path_finding, other])
+        det.allowlist = ["/usr/bin/passwd", "/usr/local/bin/*"]
+        self.assertEqual(det.run_once(), [])
+
     def test_save_baseline_prunes_removed_hashes(self) -> None:
         det = StubDetector(self.db, [_finding("one"), _finding("two")])
         det.run_once()

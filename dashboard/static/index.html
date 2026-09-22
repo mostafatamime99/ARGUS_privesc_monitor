@@ -231,6 +231,15 @@ td {
 tr:last-child td { border-bottom: none; }
 tr:hover td { background: var(--surface2); }
 .msg { word-break: break-word; }
+.msg pre.details {
+  margin-top: 6px;
+  white-space: pre-wrap;
+  font-size: 0.8rem;
+  color: var(--muted);
+  max-height: 160px;
+  overflow: auto;
+}
+.host { color: var(--muted); font-size: 0.85rem; }
 .timestamp { font-family: var(--mono); font-size: 0.78rem; color: var(--muted); white-space: nowrap; }
 .ack-badge {
   display: inline-block;
@@ -401,12 +410,13 @@ footer {
           <th data-col="timestamp">Timestamp <span class="sort-icon">↕</span></th>
           <th data-col="severity">Severity <span class="sort-icon">↕</span></th>
           <th data-col="detector_name">Detector <span class="sort-icon">↕</span></th>
+          <th data-col="hostname">Host <span class="sort-icon">↕</span></th>
           <th>Message</th>
           <th data-col="acknowledged">Ack <span class="sort-icon">↕</span></th>
         </tr>
       </thead>
       <tbody id="alert-body">
-        <tr class="empty-row"><td colspan="6"><span class="loading-spinner"></span> Loading alerts…</td></tr>
+        <tr class="empty-row"><td colspan="7"><span class="loading-spinner"></span> Loading alerts…</td></tr>
       </tbody>
     </table>
   </div>
@@ -417,7 +427,7 @@ footer {
   <div class="container">
     ARGUS Dashboard — read-only monitoring view &nbsp;|&nbsp;
     No actions can be performed from this interface.
-    Alerts can only be acknowledged via the ARGUS CLI or SQLite directly.
+    Acknowledge an alert with <code>python main.py ack &lt;id&gt;</code>.
   </div>
 </footer>
 
@@ -547,7 +557,7 @@ function renderAlerts() {
 
   const tbody = document.getElementById("alert-body");
   if (!sorted.length) {
-    tbody.innerHTML = "<tr class='empty-row'><td colspan='6'>No alerts match the current filter.</td></tr>";
+    tbody.innerHTML = "<tr class='empty-row'><td colspan='7'>No alerts match the current filter.</td></tr>";
     return;
   }
 
@@ -557,9 +567,15 @@ function renderAlerts() {
       <td class="timestamp">${fmtTs(row.timestamp)}</td>
       <td>${sevBadge(row.severity)}</td>
       <td><code>${row.detector_name}</code></td>
-      <td class="msg">${escHtml(row.message)}</td>
+      <td class="host">${escHtml(row.hostname || "—")}</td>
+      <td class="msg">${escHtml(row.message)}${detailsBlock(row.details)}</td>
       <td><span class="ack-badge ${row.acknowledged ? 'yes' : 'no'}">${row.acknowledged ? "yes" : "no"}</span></td>
     </tr>`).join("");
+}
+
+function detailsBlock(details) {
+  if (!details || typeof details !== "object" || !Object.keys(details).length) return "";
+  return `<pre class="details">${escHtml(JSON.stringify(details, null, 2))}</pre>`;
 }
 
 function escHtml(s) {

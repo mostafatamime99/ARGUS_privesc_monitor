@@ -15,6 +15,11 @@ from storage.db import Database
 
 
 class TestParseArgs(unittest.TestCase):
+    def test_ack_ids(self) -> None:
+        args = app.parse_args(["ack", "4", "9", "-c", "config.yaml"])
+        self.assertEqual(args.command, "ack")
+        self.assertEqual(args.ids, [4, 9])
+
     def test_dry_run_flag(self) -> None:
         args = app.parse_args(["--dry-run", "-c", "config.yaml"])
         self.assertTrue(args.dry_run)
@@ -189,6 +194,35 @@ class TestEmitFindingsDryRun(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["detector_name"], "version_scanner")
 
+    async def test_persists_hostname_and_details(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        db = Database(Path(tmp.name) / "t.db")
+        self.addCleanup(db.close)
+        bot = mock.Mock()
+        bot.notify = mock.Mock(return_value=0)
+        finding = Finding(
+            detector_name="sudoers_check",
+            severity="high",
+            message="modified /etc/sudoers",
+            item_key="modified:/etc/sudoers",
+            details={"path": "/etc/sudoers", "diff": "+ ALL"},
+        )
+        await app.emit_findings(
+            [finding],
+            db=db,
+            bot=bot,
+            dry_run=True,
+            lock=asyncio.Lock(),
+            hostname="web-01",
+        )
+        row = db.recent_alerts(limit=1)[0]
+        self.assertEqual(row["hostname"], "web-01")
+        self.assertIn("/etc/sudoers", row["details"])
+        self.assertIn("+ ALL", row["details"])
+        ok, msg = db.verify_chain()
+        self.assertTrue(ok, msg)
+
 
 class TestSetupLogging(unittest.TestCase):
     def test_creates_rotating_log_file(self) -> None:
@@ -207,6 +241,47 @@ class TestSetupLogging(unittest.TestCase):
         )
         logging.getLogger("privesc_monitor").info("hello-rotate")
         self.assertTrue(log_path.is_file())
+
+
+class TestAcknowledgeCli(unittest.TestCase):
+    def test_ack_marks_alert_without_breaking_chain(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        db_path = root / "alerts.db"
+        cfg_path = root / "config.yaml"
+        cfg_path.write_text(
+            f"daemon:\n  db_path: {db_path.as_posix()}\n",
+            encoding="utf-8",
+        )
+        db = Database(db_path)
+        alert_id = db.insert_alert("2026-01-01", "suid_check", "high", "msg")
+        db.close()
+
+        code = app.main(["ack", str(alert_id), "-c", str(cfg_path)])
+        self.assertEqual(code, 0)
+
+        db = Database(db_path)
+        self.addCleanup(db.close)
+        row = db.get_alert_by_id(alert_id)
+        assert row is not None
+        self.assertEqual(row["acknowledged"], 1)
+        ok, msg = db.verify_chain()
+        self.assertTrue(ok, msg)
+
+    def test_ack_missing_id_returns_error(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        db_path = root / "alerts.db"
+        cfg_path = root / "config.yaml"
+        cfg_path.write_text(
+            f"daemon:\n  db_path: {db_path.as_posix()}\n",
+            encoding="utf-8",
+        )
+        Database(db_path).close()
+        code = app.main(["ack", "99", "-c", str(cfg_path)])
+        self.assertEqual(code, 1)
         # Release file handles so temp cleanup succeeds on Windows
         root = logging.getLogger()
         for handler in list(root.handlers):

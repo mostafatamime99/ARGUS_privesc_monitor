@@ -78,7 +78,7 @@ class SuidCheckDetector(BaseDetector):
         removed = self._removed_findings(baseline_hashes - current_hashes)
 
         self.save_baseline(current)
-        return novel + removed
+        return self.suppress_allowlisted(novel + removed)
 
     def _removed_findings(self, removed_hashes: set[str]) -> list[Finding]:
         if not removed_hashes:

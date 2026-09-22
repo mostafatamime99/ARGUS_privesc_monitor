@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 from collections import deque
@@ -30,6 +31,9 @@ SEVERITY_LABEL: dict[str, str] = {
 # Telegram hard limit ~4096; leave headroom for UTF-8 / markup
 _MAX_MESSAGE_CHARS = 4000
 
+# A deferred item is (finding, outbox row id or None when no database is attached).
+_Pending = tuple[Finding, int | None]
+
 
 class _SessionLike(Protocol):
     def post(self, url: str, **kwargs: Any) -> Any: ...
@@ -57,6 +61,8 @@ class TelegramBot:
         *,
         session: _SessionLike | None = None,
         time_fn: Callable[[], float] | None = None,
+        db: Any | None = None,
+        hostname: str | None = None,
     ) -> None:
         telegram = config.get("telegram", config)
         self.enabled: bool = bool(telegram.get("enabled", False))
@@ -68,10 +74,16 @@ class TelegramBot:
         if self.max_alerts_per_minute < 1:
             raise ValueError("telegram.max_alerts_per_minute must be >= 1")
 
+        if hostname is None:
+            daemon_cfg = config.get("daemon") or {}
+            hostname = str(daemon_cfg.get("hostname") or "")
+        self.hostname: str = str(hostname or "").strip()
+
+        self._db = db
         self._session: _SessionLike | None = session
         self._time = time_fn or time.monotonic
         self._send_times: Deque[float] = deque()
-        self._deferred: list[Finding] = []
+        self._deferred: list[_Pending] = []
 
         if self.enabled and (not self.bot_token or not self.chat_id):
             logger.warning(
@@ -88,11 +100,15 @@ class TelegramBot:
         sev = finding.severity.lower()
         emoji = SEVERITY_EMOJI.get(sev, "🟡")
         label = SEVERITY_LABEL.get(sev, finding.severity.upper())
-        lines = [
-            f"{emoji} {label} | {finding.detector_name}",
-            finding.message,
-            f"key: `{finding.item_key}`",
-        ]
+        lines = [f"{emoji} {label} | {finding.detector_name}"]
+        if self.hostname:
+            lines.append(f"host: {self.hostname}")
+        lines.extend(
+            [
+                finding.message,
+                f"key: `{finding.item_key}`",
+            ]
+        )
         if finding.details:
             # Keep details compact — path/bits are the usual signal
             for key in (
@@ -131,9 +147,10 @@ class TelegramBot:
             f"{SEVERITY_EMOJI.get(sev, '🟡')} {SEVERITY_LABEL.get(sev, sev.upper())}×{n}"
             for sev, n in sorted(counts.items(), key=lambda kv: kv[0])
         )
+        host_bit = f" — {self.hostname}" if self.hostname else ""
         header = (
             f"📦 Batched summary — {len(findings)} alert(s) rate-limited "
-            f"({count_bits})"
+            f"({count_bits}){host_bit}"
         )
         body_lines = [header, ""]
         for f in findings:
@@ -158,6 +175,9 @@ class TelegramBot:
         """
         Send findings to Telegram, respecting the per-minute cap.
 
+        When a database is attached, each finding is written to the outbox
+        before the send attempt. A restart can retry anything still unsent.
+
         Returns the number of Telegram API messages actually sent.
         """
         items = [findings] if isinstance(findings, Finding) else list(findings)
@@ -171,8 +191,9 @@ class TelegramBot:
             )
             return 0
 
+        staged = [(finding, self._stage(finding)) for finding in items]
         # Retry anything deferred once capacity returns
-        queue = self._deferred + items
+        queue = self._deferred + staged
         self._deferred = []
         return self._dispatch(queue)
 
@@ -186,42 +207,120 @@ class TelegramBot:
         self._deferred = []
         return self._dispatch(queue)
 
-    def _dispatch(self, findings: list[Finding]) -> int:
+    def recover_unsent(self) -> int:
+        """Load outbox rows that never got a successful send into the defer queue."""
+        if self._db is None:
+            return 0
+        rows = self._db.unsent_outbox()
+        recovered: list[_Pending] = []
+        for row in rows:
+            finding = self._finding_from_payload(str(row["payload"]))
+            if finding is None:
+                logger.warning("Skipping unreadable Telegram outbox row id=%s", row["id"])
+                continue
+            recovered.append((finding, int(row["id"])))
+        self._deferred = recovered
+        return len(recovered)
+
+    def _stage(self, finding: Finding) -> int | None:
+        if self._db is None:
+            return None
+        return int(self._db.enqueue_outbox(self._payload(finding)))
+
+    def _mark_sent(self, outbox_id: int | None) -> None:
+        if self._db is None or outbox_id is None:
+            return
+        self._db.mark_outbox_sent(outbox_id)
+
+    @staticmethod
+    def _payload(finding: Finding) -> str:
+        return json.dumps(
+            {
+                "detector_name": finding.detector_name,
+                "severity": finding.severity,
+                "message": finding.message,
+                "item_key": finding.item_key,
+                "details": finding.details,
+                "notify": finding.notify,
+            },
+            sort_keys=True,
+            default=str,
+        )
+
+    @staticmethod
+    def _finding_from_payload(payload: str) -> Finding | None:
+        try:
+            data = json.loads(payload)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(data, dict):
+            return None
+        details = data.get("details") or {}
+        if not isinstance(details, dict):
+            details = {}
+        try:
+            return Finding(
+                detector_name=str(data.get("detector_name") or "unknown"),
+                severity=str(data.get("severity") or "info"),
+                message=str(data.get("message") or ""),
+                item_key=str(data.get("item_key") or ""),
+                details=details,
+                notify=bool(data.get("notify", True)),
+            )
+        except (TypeError, ValueError):
+            return None
+
+    def _dispatch(self, pending: list[_Pending]) -> int:
         sent = 0
         remaining = self._slots_remaining()
 
         if remaining <= 0:
-            self._deferred.extend(findings)
+            self._deferred.extend(pending)
             logger.info(
                 "Rate limit reached (%d/min); deferring %d finding(s)",
                 self.max_alerts_per_minute,
-                len(findings),
+                len(pending),
             )
             return 0
 
-        if len(findings) <= remaining:
-            for finding in findings:
+        if len(pending) <= remaining:
+            failed: list[_Pending] = []
+            for finding, outbox_id in pending:
                 if self._send_text(self.format_alert(finding)):
                     sent += 1
+                    self._mark_sent(outbox_id)
+                else:
+                    failed.append((finding, outbox_id))
+            self._deferred.extend(failed)
             return sent
 
         # Need one slot for the summary of the overflow.
         individual_slots = max(0, remaining - 1)
-        for finding in findings[:individual_slots]:
+        failed = []
+        for finding, outbox_id in pending[:individual_slots]:
             if self._send_text(self.format_alert(finding)):
                 sent += 1
+                self._mark_sent(outbox_id)
+            else:
+                failed.append((finding, outbox_id))
 
-        overflow = findings[individual_slots:]
+        overflow = pending[individual_slots:]
         if overflow:
             if self._slots_remaining() > 0:
-                if self._send_text(self.format_summary(overflow)):
+                summary = self.format_summary([item[0] for item in overflow])
+                if self._send_text(summary):
                     sent += 1
+                    for _, outbox_id in overflow:
+                        self._mark_sent(outbox_id)
+                else:
+                    failed.extend(overflow)
             else:
-                self._deferred.extend(overflow)
+                failed.extend(overflow)
                 logger.info(
                     "Deferred %d finding(s) after filling rate window",
                     len(overflow),
                 )
+        self._deferred.extend(failed)
         return sent
 
     def _can_send(self) -> bool:

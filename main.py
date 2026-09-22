@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import logging
+import socket
 import sys
 from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
@@ -131,15 +133,29 @@ def build_detectors(
     return poll, watch
 
 
-def persist_findings(db: Database, findings: Sequence[Finding]) -> None:
-    """Write findings to the alerts table."""
+def resolve_hostname(config: dict[str, Any]) -> str:
+    """Hostname stamped on every alert. Config wins; otherwise the machine name."""
+    daemon_cfg = config.get("daemon") or {}
+    configured = str(daemon_cfg.get("hostname") or "").strip()
+    if configured:
+        return configured
+    return socket.gethostname()
+
+
+def persist_findings(
+    db: Database, findings: Sequence[Finding], *, hostname: str = ""
+) -> None:
+    """Write findings to the alerts table, including structured details."""
     now = datetime.now(timezone.utc).isoformat()
     for finding in findings:
+        details = json.dumps(finding.details, sort_keys=True, default=str)
         db.insert_alert(
             timestamp=now,
             detector_name=finding.detector_name,
             severity=finding.severity,
             message=finding.message,
+            hostname=hostname,
+            details=details,
         )
 
 
@@ -166,6 +182,7 @@ async def emit_findings(
     bot: TelegramBot,
     dry_run: bool,
     lock: asyncio.Lock,
+    hostname: str = "",
 ) -> None:
     """Log, persist, and optionally Telegram-notify findings."""
     if not findings:
@@ -175,7 +192,7 @@ async def emit_findings(
         log_finding(finding, dry_run=dry_run)
 
     async with lock:
-        await asyncio.to_thread(persist_findings, db, findings)
+        await asyncio.to_thread(persist_findings, db, findings, hostname=hostname)
 
     if dry_run:
         logger.info(
@@ -206,6 +223,7 @@ async def poll_loop(
     dry_run: bool,
     lock: asyncio.Lock,
     stop: asyncio.Event,
+    hostname: str = "",
 ) -> None:
     """Run poll-based detectors every ``interval`` seconds."""
     if not detectors:
@@ -225,7 +243,12 @@ async def poll_loop(
                 logger.exception("Poll detector %s failed", detector.name)
                 continue
             await emit_findings(
-                findings, db=db, bot=bot, dry_run=dry_run, lock=lock
+                findings,
+                db=db,
+                bot=bot,
+                dry_run=dry_run,
+                lock=lock,
+                hostname=hostname,
             )
         try:
             await asyncio.wait_for(stop.wait(), timeout=interval)
@@ -241,6 +264,7 @@ async def watch_drain_loop(
     dry_run: bool,
     lock: asyncio.Lock,
     stop: asyncio.Event,
+    hostname: str = "",
     interval: float = WATCH_DRAIN_INTERVAL_SECONDS,
 ) -> None:
     """
@@ -265,7 +289,12 @@ async def watch_drain_loop(
                 logger.exception("Watch detector %s failed", detector.name)
                 continue
             await emit_findings(
-                findings, db=db, bot=bot, dry_run=dry_run, lock=lock
+                findings,
+                db=db,
+                bot=bot,
+                dry_run=dry_run,
+                lock=lock,
+                hostname=hostname,
             )
         try:
             await asyncio.wait_for(stop.wait(), timeout=interval)
@@ -303,7 +332,8 @@ async def startup_checks(
     *,
     dry_run: bool,
     lock: asyncio.Lock,
-) -> None:
+    hostname: str = "",
+) -> bool:
     """
     Run at every daemon (re)start:
     1. Verify the SQLite integrity chain.  Emit a CRITICAL alert if broken.
@@ -327,7 +357,14 @@ async def startup_checks(
             message=f"Database tampering detected: {chain_msg}",
             item_key=f"integrity:tamper",
         )
-        await emit_findings([tamper_finding], db=db, bot=bot, dry_run=dry_run, lock=lock)
+        await emit_findings(
+            [tamper_finding],
+            db=db,
+            bot=bot,
+            dry_run=dry_run,
+            lock=lock,
+            hostname=hostname,
+        )
 
     # --- Startup announcement ---
     restart_msg = f"ARGUS daemon (re)started at {ts}"
@@ -339,19 +376,90 @@ async def startup_checks(
         item_key=f"restart:{ts}",
     )
     # Always persist the restart event so the dashboard shows it; notify Telegram too.
-    await emit_findings([restart_finding], db=db, bot=bot, dry_run=dry_run, lock=lock)
+    await emit_findings(
+        [restart_finding],
+        db=db,
+        bot=bot,
+        dry_run=dry_run,
+        lock=lock,
+        hostname=hostname,
+    )
+    return ok
+
+
+async def integrity_loop(
+    db: Database,
+    bot: TelegramBot,
+    *,
+    interval: float,
+    dry_run: bool,
+    lock: asyncio.Lock,
+    stop: asyncio.Event,
+    hostname: str,
+    already_broken: bool,
+) -> None:
+    """Re-check the hash chain while the daemon is up.
+
+    A failure is announced once. Recovery clears that latch so a later break
+    alerts again. ``interval`` <= 0 disables the loop.
+    """
+    if interval <= 0:
+        await stop.wait()
+        return
+
+    announced = already_broken
+    logger.info("Integrity recheck every %.0fs", interval)
+    while not stop.is_set():
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=interval)
+            return
+        except asyncio.TimeoutError:
+            pass
+        try:
+            ok, chain_msg = await asyncio.to_thread(db.verify_chain)
+        except Exception:
+            logger.exception("Integrity recheck failed")
+            continue
+        if ok:
+            if announced:
+                logger.info("DB integrity chain recovered: %s", chain_msg)
+            announced = False
+            continue
+        logger.critical("DB INTEGRITY CHECK FAILED: %s", chain_msg)
+        if announced:
+            continue
+        announced = True
+        tamper_finding = Finding(
+            detector_name="argus_integrity",
+            severity="critical",
+            message=f"Database tampering detected: {chain_msg}",
+            item_key="integrity:tamper",
+        )
+        await emit_findings(
+            [tamper_finding],
+            db=db,
+            bot=bot,
+            dry_run=dry_run,
+            lock=lock,
+            hostname=hostname,
+        )
 
 
 async def run_daemon(config: dict[str, Any], *, dry_run: bool = False) -> None:
     """Initialize detectors and run poll + watch loops until cancelled."""
     daemon_cfg = config.get("daemon") or {}
     interval = float(daemon_cfg.get("scan_interval_seconds", 60))
-    db_path = Path(daemon_cfg.get("db_path", "privesc_monitor.db"))
-    if not db_path.is_absolute():
-        db_path = Path(__file__).resolve().parent / db_path
+    integrity_interval = float(daemon_cfg.get("integrity_check_seconds", 300))
+    db_path = resolve_db_path(config)
+    hostname = resolve_hostname(config)
 
     db = Database(db_path)
-    bot = TelegramBot(config)
+    bot = TelegramBot(config, db=db, hostname=hostname)
+    recovered = bot.recover_unsent()
+    if recovered:
+        logger.info(
+            "Telegram outbox: %d unsent message(s) queued for retry", recovered
+        )
     poll_detectors, watch_detectors = build_detectors(config, db)
 
     if dry_run:
@@ -370,7 +478,9 @@ async def run_daemon(config: dict[str, Any], *, dry_run: bool = False) -> None:
     lock = asyncio.Lock()
 
     # Startup integrity check + restart announcement (before detection loops).
-    await startup_checks(db, bot, dry_run=dry_run, lock=lock)
+    chain_ok = await startup_checks(
+        db, bot, dry_run=dry_run, lock=lock, hostname=hostname
+    )
 
     logger.info(
         "PrivescMonitor running (poll=%d, watch=%d, interval=%.1fs, dry_run=%s)",
@@ -416,6 +526,7 @@ async def run_daemon(config: dict[str, Any], *, dry_run: bool = False) -> None:
                 dry_run=dry_run,
                 lock=lock,
                 stop=stop,
+                hostname=hostname,
             ),
             name="poll_loop",
         ),
@@ -427,12 +538,26 @@ async def run_daemon(config: dict[str, Any], *, dry_run: bool = False) -> None:
                 dry_run=dry_run,
                 lock=lock,
                 stop=stop,
+                hostname=hostname,
             ),
             name="watch_drain_loop",
         ),
         asyncio.create_task(
             deferred_flush_loop(bot, dry_run=dry_run, stop=stop),
             name="deferred_flush_loop",
+        ),
+        asyncio.create_task(
+            integrity_loop(
+                db,
+                bot,
+                interval=integrity_interval,
+                dry_run=dry_run,
+                lock=lock,
+                stop=stop,
+                hostname=hostname,
+                already_broken=not chain_ok,
+            ),
+            name="integrity_loop",
         ),
     ]
 
@@ -460,9 +585,51 @@ async def run_daemon(config: dict[str, Any], *, dry_run: bool = False) -> None:
         logger.info("PrivescMonitor stopped")
 
 
+def resolve_db_path(config: dict[str, Any]) -> Path:
+    """SQLite path from config, relative paths anchored at the project root."""
+    daemon_cfg = config.get("daemon") or {}
+    db_path = Path(daemon_cfg.get("db_path", "privesc_monitor.db"))
+    if not db_path.is_absolute():
+        db_path = Path(__file__).resolve().parent / db_path
+    return db_path
+
+
+def acknowledge_cli(config: dict[str, Any], alert_ids: Sequence[int]) -> int:
+    """Mark alerts acknowledged without breaking the integrity chain."""
+    if not alert_ids:
+        print("Usage: python main.py ack <id> [<id> ...]", file=sys.stderr)
+        return 1
+    db = Database(resolve_db_path(config))
+    try:
+        newly, missing = db.acknowledge_alerts(alert_ids)
+    finally:
+        db.close()
+    print(f"Acknowledged {newly} alert(s)")
+    if missing:
+        print(
+            "Not found: " + ", ".join(str(alert_id) for alert_id in missing),
+            file=sys.stderr,
+        )
+        return 1
+    return 0
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="PrivescMonitor — real-time Linux priv-esc vector detection"
+    )
+    parser.add_argument(
+        "command",
+        nargs="?",
+        default="run",
+        choices=["run", "ack"],
+        help="Omit or pass 'run' to start the daemon. 'ack' marks alert ids acknowledged.",
+    )
+    parser.add_argument(
+        "ids",
+        nargs="*",
+        type=int,
+        help="Alert ids to acknowledge when command is ack",
     )
     parser.add_argument(
         "-c",
@@ -486,7 +653,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def main(argv: list[str] | None = None) -> int:
-    print_banner()
     args = parse_args(argv)
 
     if not args.config.is_file():
@@ -500,6 +666,10 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Failed to load config: {exc}", file=sys.stderr)
         return 1
 
+    if args.command == "ack":
+        return acknowledge_cli(config, args.ids)
+
+    print_banner()
     setup_logging(config, verbose=args.verbose)
 
     try:

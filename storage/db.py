@@ -26,12 +26,15 @@ CREATE TABLE IF NOT EXISTS baselines (
 );
 
 CREATE TABLE IF NOT EXISTS alerts (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    timestamp     TEXT NOT NULL,
-    detector_name TEXT NOT NULL,
-    severity      TEXT NOT NULL,
-    message       TEXT NOT NULL,
-    acknowledged  INTEGER NOT NULL DEFAULT 0
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp      TEXT NOT NULL,
+    detector_name  TEXT NOT NULL,
+    severity       TEXT NOT NULL,
+    message        TEXT NOT NULL,
+    acknowledged   INTEGER NOT NULL DEFAULT 0,
+    hostname       TEXT NOT NULL DEFAULT '',
+    details        TEXT NOT NULL DEFAULT '',
+    digest_version INTEGER NOT NULL DEFAULT 1
 );
 
 CREATE INDEX IF NOT EXISTS idx_baselines_detector
@@ -57,6 +60,16 @@ CREATE TABLE IF NOT EXISTS integrity_chain (
 
 CREATE INDEX IF NOT EXISTS idx_chain_seq
     ON integrity_chain (seq);
+
+CREATE TABLE IF NOT EXISTS telegram_outbox (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at TEXT NOT NULL,
+    payload    TEXT NOT NULL,
+    sent_at    TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_outbox_unsent
+    ON telegram_outbox (sent_at);
 """
 
 # ---------------------------------------------------------------------------
@@ -72,23 +85,76 @@ def _alert_row_digest(
     detector_name: str,
     severity: str,
     message: str,
+    *,
+    hostname: str = "",
+    details: str = "",
+    digest_version: int = 1,
 ) -> str:
-    """Canonical digest of an alerts row.  Only immutable fields are hashed
-    (acknowledged is intentionally excluded so ACKing doesn't break the chain).
+    """Canonical digest of an alerts row.
+
+    ``acknowledged`` is excluded so marking an alert read does not break the
+    chain.  Rows written before hostname/details existed stay on digest
+    version 1.  New rows use version 2, which also covers those columns.
     """
-    payload = json.dumps(
-        {
-            "table": "alerts",
-            "key": f"alerts:{alert_id}",
-            "id": alert_id,
-            "timestamp": timestamp,
-            "detector_name": detector_name,
-            "severity": severity,
-            "message": message,
-        },
-        sort_keys=True,
+    payload: dict[str, object] = {
+        "table": "alerts",
+        "key": f"alerts:{alert_id}",
+        "id": alert_id,
+        "timestamp": timestamp,
+        "detector_name": detector_name,
+        "severity": severity,
+        "message": message,
+    }
+    if int(digest_version) >= 2:
+        payload["hostname"] = hostname
+        payload["details"] = details
+        payload["digest_version"] = 2
+    encoded = json.dumps(payload, sort_keys=True)
+    return hashlib.sha256(encoded.encode()).hexdigest()
+
+
+def _alert_digest_from_row(alert: sqlite3.Row) -> str:
+    """Recompute a stored alert's digest, honoring its digest version."""
+    keys = set(alert.keys())
+
+    def _text(name: str) -> str:
+        if name not in keys or alert[name] is None:
+            return ""
+        return str(alert[name])
+
+    version = 1
+    if "digest_version" in keys and alert["digest_version"] is not None:
+        version = int(alert["digest_version"])
+    return _alert_row_digest(
+        alert["id"],
+        alert["timestamp"],
+        alert["detector_name"],
+        alert["severity"],
+        alert["message"],
+        hostname=_text("hostname"),
+        details=_text("details"),
+        digest_version=version,
     )
-    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def alert_select_columns(conn: sqlite3.Connection) -> str:
+    """Column list for alerts reads that still works on a pre-migration file."""
+    cols = {
+        row["name"]
+        for row in conn.execute("PRAGMA table_info(alerts)").fetchall()
+    }
+    wanted = [
+        "id",
+        "timestamp",
+        "detector_name",
+        "severity",
+        "message",
+        "acknowledged",
+    ]
+    for extra in ("hostname", "details", "digest_version"):
+        if extra in cols:
+            wanted.append(extra)
+    return ", ".join(wanted)
 
 
 def _compute_chain_hash(prev_hash: str, row_digest: str) -> str:
@@ -132,10 +198,20 @@ def verify_chain_conn(conn: sqlite3.Connection) -> tuple[bool, str]:
         )
 
     # Load all alerts in a single pass for O(n) verification.
+    # Older databases may not have hostname/details yet; select only what exists
+    # so a read-only dashboard can still verify a pre-migration file.
+    present = {
+        row["name"]
+        for row in conn.execute("PRAGMA table_info(alerts)").fetchall()
+    }
+    verify_cols = ["id", "timestamp", "detector_name", "severity", "message"]
+    for extra in ("hostname", "details", "digest_version"):
+        if extra in present:
+            verify_cols.append(extra)
     alerts_map: dict[int, sqlite3.Row] = {
         row["id"]: row
         for row in conn.execute(
-            "SELECT id, timestamp, detector_name, severity, message FROM alerts"
+            f"SELECT {', '.join(verify_cols)} FROM alerts"
         ).fetchall()
     }
 
@@ -170,13 +246,7 @@ def verify_chain_conn(conn: sqlite3.Connection) -> tuple[bool, str]:
                     f"seq={seq}: alert id={alert_id} referenced by chain "
                     "is missing from the alerts table (deleted?)"
                 )
-            actual_digest = _alert_row_digest(
-                alert["id"],
-                alert["timestamp"],
-                alert["detector_name"],
-                alert["severity"],
-                alert["message"],
-            )
+            actual_digest = _alert_digest_from_row(alert)
         else:
             # Unknown table — trust stored digest; still verify chain link.
             actual_digest = stored_row_digest
@@ -215,6 +285,7 @@ class Database:
             self._conn.execute("PRAGMA journal_mode=WAL;")
             self._conn.executescript(SCHEMA)
             self._migrate_baselines()
+            self._migrate_alerts()
             self._conn.commit()
 
     def _migrate_baselines(self) -> None:
@@ -230,6 +301,26 @@ class Database:
         if "payload" not in cols:
             self._conn.execute(
                 "ALTER TABLE baselines ADD COLUMN payload TEXT NOT NULL DEFAULT ''"
+            )
+
+    def _migrate_alerts(self) -> None:
+        """Add hostname, details, and digest_version on databases created earlier."""
+        cols = {
+            row["name"]
+            for row in self._conn.execute("PRAGMA table_info(alerts)").fetchall()
+        }
+        if "hostname" not in cols:
+            self._conn.execute(
+                "ALTER TABLE alerts ADD COLUMN hostname TEXT NOT NULL DEFAULT ''"
+            )
+        if "details" not in cols:
+            self._conn.execute(
+                "ALTER TABLE alerts ADD COLUMN details TEXT NOT NULL DEFAULT ''"
+            )
+        if "digest_version" not in cols:
+            # Existing rows keep version 1 so their stored chain digests still match.
+            self._conn.execute(
+                "ALTER TABLE alerts ADD COLUMN digest_version INTEGER NOT NULL DEFAULT 1"
             )
 
     def close(self) -> None:
@@ -382,18 +473,45 @@ class Database:
         severity: str,
         message: str,
         acknowledged: bool = False,
+        hostname: str = "",
+        details: str = "",
     ) -> int:
+        """Insert an alert and append a version-2 integrity digest.
+
+        ``hostname`` and ``details`` are covered by the chain. ``acknowledged``
+        is not, so a later ack does not look like tampering.
+        """
+        host = hostname or ""
+        detail_text = details or ""
         with self._lock:
             cur = self._conn.execute(
                 """
-                INSERT INTO alerts (timestamp, detector_name, severity, message, acknowledged)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO alerts (
+                    timestamp, detector_name, severity, message, acknowledged,
+                    hostname, details, digest_version
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, 2)
                 """,
-                (timestamp, detector_name, severity, message, int(acknowledged)),
+                (
+                    timestamp,
+                    detector_name,
+                    severity,
+                    message,
+                    int(acknowledged),
+                    host,
+                    detail_text,
+                ),
             )
             alert_id = int(cur.lastrowid)
             digest = _alert_row_digest(
-                alert_id, timestamp, detector_name, severity, message
+                alert_id,
+                timestamp,
+                detector_name,
+                severity,
+                message,
+                hostname=host,
+                details=detail_text,
+                digest_version=2,
             )
             self._append_chain_locked("alerts", f"alerts:{alert_id}", digest)
             self._conn.commit()
@@ -406,6 +524,65 @@ class Database:
                 (alert_id,),
             )
             self._conn.commit()
+
+    def acknowledge_alerts(self, alert_ids: Sequence[int]) -> tuple[int, list[int]]:
+        """Mark alerts acknowledged.
+
+        Returns ``(newly_acknowledged, missing_ids)``. Ids that were already
+        acknowledged are not counted again and are not treated as missing.
+        """
+        newly = 0
+        missing: list[int] = []
+        with self._lock:
+            for alert_id in alert_ids:
+                row = self._conn.execute(
+                    "SELECT acknowledged FROM alerts WHERE id = ?",
+                    (int(alert_id),),
+                ).fetchone()
+                if row is None:
+                    missing.append(int(alert_id))
+                    continue
+                if not row["acknowledged"]:
+                    self._conn.execute(
+                        "UPDATE alerts SET acknowledged = 1 WHERE id = ?",
+                        (int(alert_id),),
+                    )
+                    newly += 1
+            self._conn.commit()
+        return newly, missing
+
+    def enqueue_outbox(self, payload: str) -> int:
+        """Store a Telegram payload until a send succeeds."""
+        now = datetime.now(timezone.utc).isoformat()
+        with self._lock:
+            cur = self._conn.execute(
+                "INSERT INTO telegram_outbox (created_at, payload, sent_at) VALUES (?, ?, NULL)",
+                (now, payload),
+            )
+            self._conn.commit()
+            return int(cur.lastrowid)
+
+    def mark_outbox_sent(self, outbox_id: int) -> None:
+        """Drop a payload once Telegram has accepted it.
+
+        Deleting (instead of flagging) keeps the table to only what still
+        needs a retry. A crash between accept and delete can send twice.
+        """
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM telegram_outbox WHERE id = ?",
+                (int(outbox_id),),
+            )
+            self._conn.commit()
+
+    def unsent_outbox(self) -> list[sqlite3.Row]:
+        with self._lock:
+            return list(
+                self._conn.execute(
+                    "SELECT id, created_at, payload FROM telegram_outbox "
+                    "WHERE sent_at IS NULL ORDER BY id"
+                ).fetchall()
+            )
 
     def get_lookup_cache(self, cache_key: str, ttl_seconds: float) -> str | None:
         """Return cached payload if present and younger than ``ttl_seconds``."""
@@ -450,7 +627,8 @@ class Database:
         with self._lock:
             cur = self._conn.execute(
                 """
-                SELECT id, timestamp, detector_name, severity, message, acknowledged
+                SELECT id, timestamp, detector_name, severity, message, acknowledged,
+                       hostname, details, digest_version
                 FROM alerts
                 ORDER BY id DESC
                 LIMIT ?
@@ -484,7 +662,8 @@ class Database:
         with self._lock:
             return list(
                 self._conn.execute(
-                    f"SELECT id, timestamp, detector_name, severity, message, acknowledged "
+                    f"SELECT id, timestamp, detector_name, severity, message, acknowledged, "
+                    f"hostname, details, digest_version "
                     f"FROM alerts {where} ORDER BY id DESC LIMIT ?",
                     params,
                 ).fetchall()
@@ -493,7 +672,8 @@ class Database:
     def get_alert_by_id(self, alert_id: int) -> sqlite3.Row | None:
         with self._lock:
             return self._conn.execute(
-                "SELECT id, timestamp, detector_name, severity, message, acknowledged "
+                "SELECT id, timestamp, detector_name, severity, message, acknowledged, "
+                "hostname, details, digest_version "
                 "FROM alerts WHERE id = ?",
                 (alert_id,),
             ).fetchone()

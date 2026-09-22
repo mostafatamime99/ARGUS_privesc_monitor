@@ -86,7 +86,7 @@ class CapabilityCheckDetector(BaseDetector):
         removed = self._removed_findings(baseline_hashes - current_hashes)
 
         self.save_baseline(current)
-        return novel + removed
+        return self.suppress_allowlisted(novel + removed)
 
     # ------------------------------------------------------------------
     # Internal helpers

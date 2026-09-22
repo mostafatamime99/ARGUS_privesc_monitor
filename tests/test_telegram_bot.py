@@ -5,8 +5,12 @@ from __future__ import annotations
 import unittest
 from unittest import mock
 
+import tempfile
+from pathlib import Path
+
 from alerts.telegram_bot import TelegramBot
 from detectors.base import Finding
+from storage.db import Database
 
 
 def _finding(
@@ -148,6 +152,61 @@ class TestTelegramRateLimit(unittest.TestCase):
         self.assertEqual(bot.chat_id, "99")
         self.assertEqual(bot.max_alerts_per_minute, 5)
         self.assertIn("NESTED", bot.api_url)
+
+    def test_hostname_is_included_when_set(self) -> None:
+        bot = TelegramBot(
+            {
+                "enabled": True,
+                "bot_token": "TEST_TOKEN",
+                "chat_id": "12345",
+                "max_alerts_per_minute": 3,
+            },
+            session=self.session,
+            time_fn=self.clock,
+            hostname="web-01",
+        )
+        text = bot.format_alert(_finding("host"))
+        self.assertIn("host: web-01", text)
+
+    def test_failed_send_is_retried_from_outbox(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        db = Database(Path(tmp.name) / "t.db")
+        self.addCleanup(db.close)
+
+        failing = mock.Mock()
+        failing.post.side_effect = OSError("telegram down")
+        bot = TelegramBot(
+            {
+                "enabled": True,
+                "bot_token": "TEST_TOKEN",
+                "chat_id": "12345",
+                "max_alerts_per_minute": 5,
+            },
+            session=failing,
+            time_fn=self.clock,
+            db=db,
+            hostname="web-01",
+        )
+        self.assertEqual(bot.notify([_finding("queued")]), 0)
+        self.assertEqual(len(db.unsent_outbox()), 1)
+
+        recovered = TelegramBot(
+            {
+                "enabled": True,
+                "bot_token": "TEST_TOKEN",
+                "chat_id": "12345",
+                "max_alerts_per_minute": 5,
+            },
+            session=self.session,
+            time_fn=self.clock,
+            db=db,
+            hostname="web-01",
+        )
+        self.assertEqual(recovered.recover_unsent(), 1)
+        self.assertEqual(recovered.flush_deferred(), 1)
+        self.assertEqual(db.unsent_outbox(), [])
+        self.assertIn("host: web-01", self._sent_texts()[-1])
 
     def test_no_hardcoded_secrets_in_module(self) -> None:
         import alerts.telegram_bot as mod
